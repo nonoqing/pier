@@ -82,7 +82,11 @@ class BitfunCli(BaseAgent):
 
         self._binary_path = binary_path
         self._exec_agent = exec_agent
-        self._model_endpoint_urls = list(model_endpoint_urls or [])
+        self._model_endpoint_urls = (
+            [model_endpoint_urls]
+            if isinstance(model_endpoint_urls, str)
+            else list(model_endpoint_urls or [])
+        )
         if not all(isinstance(url, str) for url in self._model_endpoint_urls):
             raise ValueError("model_endpoint_urls must contain only strings")
         self._bitfun_config = bitfun_config

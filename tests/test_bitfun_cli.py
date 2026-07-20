@@ -37,6 +37,15 @@ def test_network_allowlist_uses_explicit_and_configured_endpoints(tmp_path: Path
     }
 
 
+def test_network_allowlist_accepts_the_single_url_cli_kwarg_form(tmp_path: Path):
+    agent = BitfunCli(
+        logs_dir=tmp_path,
+        model_endpoint_urls="https://gateway.example.com/v1",
+    )
+
+    assert agent.network_allowlist().domains == ["gateway.example.com"]
+
+
 def test_commit_script_commits_all_changes_without_fabricating_a_patch():
     script = build_commit_final_changes_script()
 
