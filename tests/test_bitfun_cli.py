@@ -1,27 +1,77 @@
 import asyncio
+import json
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
+from pier.agents.installed.base import NonZeroAgentExitCodeError
 from pier.agents.installed.bitfun_cli import (
     BitfunCli,
     _NETWORK_POLICY_PREAMBLE,
+    _format_failure_log_text,
     build_commit_final_changes_script,
+    build_repo_state_capture_script,
 )
 from pier.environments.base import ExecResult
 from pier.models.agent.context import AgentContext
 
 
 class FakeEnvironment:
-    def __init__(self, allow_internet: bool = False):
+    def __init__(self, *, allow_internet: bool = False, fail_cli: bool = False):
         self.task_env_config = SimpleNamespace(allow_internet=allow_internet)
+        self.fail_cli = fail_cli
         self.calls: list[tuple[str, dict[str, str]]] = []
+        self.uploads: dict[str, str] = {}
 
     def agent_process_env(self, env: dict[str, str]) -> dict[str, str]:
         return {"PIER_NETWORK_PROXY": "enabled", **env}
 
     async def exec(self, *, command: str, env: dict[str, str]):
         self.calls.append((command, env))
-        return ExecResult(stdout="bitfun-cli 1.2.3\n", return_code=0)
+        if "CONFIG_PATH" in command:
+            return ExecResult(
+                stdout="path=/testbed/.config/bitfun/config/app.json\nexists=true\n",
+                return_code=0,
+            )
+        if "bitfun-cli exec" in command and self.fail_cli:
+            return ExecResult(
+                stdout="provider request failed: diagnostic marker", return_code=7
+            )
+        if "bitfun-cli --version" in command:
+            return ExecResult(stdout="bitfun-cli 1.2.3\n", return_code=0)
+        if "sha256sum" in command:
+            return ExecResult(
+                stdout="checksum  /usr/local/bin/bitfun-cli\n", return_code=0
+            )
+        return ExecResult(stdout="", return_code=0)
+
+    async def download_file(self, source_path: str, target_path: Path):
+        Path(target_path).write_text(
+            json.dumps(
+                {
+                    "ai": {
+                        "default_models": {
+                            "primary": "deepseek-v4-pro",
+                            "fast": "deepseek-v4-pro",
+                        },
+                        "models": [
+                            {
+                                "id": "deepseek-v4-pro",
+                                "provider": "deepseek",
+                                "model_name": "DeepSeek-V4-Pro",
+                                "reasoning_effort": "max",
+                                "api_key": "must-not-leak",
+                            }
+                        ],
+                    }
+                }
+            )
+        )
+
+    async def upload_file(self, source_path: Path, target_path: str):
+        self.uploads[target_path] = Path(source_path).read_text()
 
 
 def test_network_allowlist_uses_explicit_and_configured_endpoints(tmp_path: Path):
@@ -47,18 +97,65 @@ def test_network_allowlist_accepts_the_single_url_cli_kwarg_form(tmp_path: Path)
 
 
 def test_commit_script_commits_all_changes_without_fabricating_a_patch():
-    script = build_commit_final_changes_script()
+    script = build_commit_final_changes_script("/logs/agent/bitfun/git")
 
     assert "git add -A" in script
     assert "git commit --no-verify" in script
+    assert "git-head.before-commit.txt" in script
     assert "/logs/artifacts/model.patch" not in script
 
 
-def test_run_uses_pier_network_environment_and_commits_after_success(tmp_path: Path):
+def test_commit_script_creates_a_commit_and_records_heads(tmp_path: Path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.com"],
+        cwd=repo,
+        check=True,
+    )
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True)
+    (repo / "tracked.txt").write_text("base\n")
+    subprocess.run(["git", "add", "."], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-m", "base"], cwd=repo, check=True)
+    (repo / "tracked.txt").write_text("changed\n")
+
+    log_dir = tmp_path / "logs"
+    subprocess.run(
+        ["bash", "-c", build_commit_final_changes_script(log_dir.as_posix())],
+        cwd=repo,
+        check=True,
+    )
+
+    assert (log_dir / "git-commit.result.txt").read_text().strip() == "committed"
+    assert (log_dir / "git-head.before-commit.txt").read_text() != (
+        log_dir / "git-head.after-commit.txt"
+    ).read_text()
+
+
+def test_repo_state_capture_is_evidence_only():
+    script = build_repo_state_capture_script("/logs/agent/bitfun/git", "before")
+
+    assert "git-head.before.txt" in script
+    assert "git status --porcelain=v1" in script
+    assert "git diff" not in script
+
+
+def test_failure_log_is_bounded_and_preserves_tail_marker():
+    payload = "a" * (512 * 1024 + 1) + "TAIL_MARKER"
+    text = _format_failure_log_text(payload)
+
+    assert "[truncated for host log]" in text
+    assert text.endswith("TAIL_MARKER")
+    assert len(text) < len(payload)
+
+
+def test_run_preserves_diagnostics_and_runtime_config(tmp_path: Path):
     agent = BitfunCli(
         logs_dir=tmp_path,
+        model_name="deepseek-v4-pro",
         model_endpoint_urls=["https://gateway.example.com/v1"],
-        extra_env={"OPENAI_API_KEY": "test-key"},
+        extra_env={"XDG_CONFIG_HOME": "/testbed/.config"},
     )
     environment = FakeEnvironment()
     context = AgentContext()
@@ -66,32 +163,44 @@ def test_run_uses_pier_network_environment_and_commits_after_success(tmp_path: P
     asyncio.run(agent.setup(environment))
     asyncio.run(agent.run("Fix the failing test.", environment, context))
 
-    run_command, run_env = environment.calls[2]
+    commands = [command for command, _ in environment.calls]
+    run_command = next(command for command in commands if "bitfun-cli exec" in command)
     assert _NETWORK_POLICY_PREAMBLE in run_command
-    assert "bitfun-cli exec --agent agentic" in run_command
-    assert run_env["PIER_NETWORK_PROXY"] == "enabled"
-    assert run_env["OPENAI_API_KEY"] == "test-key"
-    assert environment.calls[3][0] == build_commit_final_changes_script()
-    assert context.metadata == {
-        "bitfun_cli": {
-            "binary_path": "/usr/local/bin/bitfun-cli",
-            "binary_sha256": "bitfun-cli",
-            "binary_version": "bitfun-cli 1.2.3",
-            "model_name": None,
-            "model_endpoint_domains": ["gateway.example.com"],
-            "exec_agent": "agentic",
-            "commit_final_changes": True,
-            "network_policy_prompt": True,
-        }
+    assert "stdbuf -oL tee" in run_command
+    assert any("git-head.before.txt" in command for command in commands)
+    assert any("git-head.after.txt" in command for command in commands)
+    assert any("cp-back-manifest.json" in command for command in commands)
+    metadata = context.metadata["bitfun_cli"]
+    assert metadata["model_endpoint_domains"] == ["gateway.example.com"]
+    assert metadata["runtime_config"]["default_models"] == {
+        "primary": "deepseek-v4-pro",
+        "fast": "deepseek-v4-pro",
     }
+    uploaded = next(iter(environment.uploads.values()))
+    assert "must-not-leak" not in uploaded
+    assert "[REDACTED]" in uploaded
+
+
+def test_cli_failure_persists_output_runs_finally_and_raises_pier_error(tmp_path: Path):
+    agent = BitfunCli(
+        logs_dir=tmp_path,
+        model_endpoint_urls=["https://gateway.example.com/v1"],
+    )
+    environment = FakeEnvironment(fail_cli=True)
+
+    with pytest.raises(NonZeroAgentExitCodeError, match="CLI exited with 7"):
+        asyncio.run(agent.run("Fix the failing test.", environment, AgentContext()))
+
+    assert "diagnostic marker" in (tmp_path / "bitfun.txt").read_text()
+    commands = [command for command, _ in environment.calls]
+    assert any("git-head.after.txt" in command for command in commands)
+    assert any("cp-back-manifest.json" in command for command in commands)
 
 
 def test_air_gapped_run_requires_a_model_endpoint(tmp_path: Path):
     agent = BitfunCli(logs_dir=tmp_path)
 
-    try:
-        asyncio.run(agent.run("Fix the failing test.", FakeEnvironment(), object()))
-    except ValueError as exc:
-        assert "model_endpoint_urls" in str(exc)
-    else:
-        raise AssertionError("expected an air-gapped endpoint validation error")
+    with pytest.raises(ValueError, match="model_endpoint_urls"):
+        asyncio.run(
+            agent.run("Fix the failing test.", FakeEnvironment(), AgentContext())
+        )

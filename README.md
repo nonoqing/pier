@@ -142,9 +142,15 @@ the agent environment. For air-gapped tasks, pass every model endpoint URL in
 URLs and does not grant general internet access. The adapter prepends a stable
 network-policy reminder, then commits the task worktree only after BitFun exits
 successfully. The task's own `pre_artifacts.sh` is solely responsible for
-creating `artifacts/model.patch`. Trial metadata records the BitFun binary
-path, SHA-256, reported version, selected model, endpoint domains, and adapter
-settings without storing credentials.
+creating `artifacts/model.patch`; the adapter never writes that artifact.
+
+The adapter retains `agent/bitfun.txt`, Git before/after evidence under
+`agent/bitfun/git/`, and a best-effort cp-back of BitFun sessions, request
+traces, CLI logs, and token records under `agent/bitfun/`, including after a
+non-zero BitFun exit. A runtime `app.redacted.json` snapshot is captured under
+`agent/bitfun/config/`; its selected primary/fast model configuration and
+redacted-config SHA-256 are placed in trial metadata. Credentials are never
+copied into the trial artifacts.
 
 ```yaml
 agents:
