@@ -129,3 +129,42 @@ For Gemini 3 via mini-swe-agent/LiteLLM, omitting `reasoning_effort` uses the Ge
   kwargs:
     set_cache_control: default_end
 ```
+
+### BitFun CLI adapter (BitFun fork)
+
+The BitFun fork provides an opt-in adapter at
+`pier.agents.installed.bitfun_cli:BitfunCli`. Keep it explicit with
+`--agent-import-path`; it is not registered as an upstream Pier agent.
+
+Mount the static `bitfun-cli` binary and its configured BitFun directory into
+the agent environment. For air-gapped tasks, pass every model endpoint URL in
+`model_endpoint_urls`; Pier derives the runtime network allowlist from those
+URLs and does not grant general internet access. The adapter prepends a stable
+network-policy reminder, then commits the task worktree only after BitFun exits
+successfully. The task's own `pre_artifacts.sh` is solely responsible for
+creating `artifacts/model.patch`. Trial metadata records the BitFun binary
+path, SHA-256, reported version, selected model, endpoint domains, and adapter
+settings without storing credentials.
+
+```yaml
+agents:
+  - import_path: pier.agents.installed.bitfun_cli:BitfunCli
+    model_name: provider/model-id
+    env:
+      XDG_CONFIG_HOME: /testbed/.config
+    kwargs:
+      binary_path: /usr/local/bin/bitfun-cli
+      model_endpoint_urls:
+        - https://model-gateway.example.com/v1
+      commit_final_changes: true
+environment:
+  mounts:
+    - type: bind
+      source: /path/on/worker/bitfun-cli
+      target: /usr/local/bin/bitfun-cli
+      read_only: true
+    - type: bind
+      source: /path/on/worker/bitfun-config
+      target: /testbed/.config/bitfun
+      read_only: true
+```
