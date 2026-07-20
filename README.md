@@ -144,10 +144,11 @@ network-policy reminder, then commits the task worktree only after BitFun exits
 successfully. The task's own `pre_artifacts.sh` is solely responsible for
 creating `artifacts/model.patch`; the adapter never writes that artifact.
 
-The adapter retains `agent/bitfun.txt`, Git before/after evidence under
-`agent/bitfun/git/`, and a best-effort cp-back of BitFun sessions, request
-traces, CLI logs, and token records under `agent/bitfun/`, including after a
-non-zero BitFun exit. A runtime `app.redacted.json` snapshot is captured under
+The adapter retains `agent/bitfun.txt`, host-durable Git before/after evidence
+under `agent/bitfun/git/`, and a host-durable cp-back manifest plus best-effort
+BitFun sessions, request traces, CLI logs, and token records under
+`agent/bitfun/`, including after a non-zero BitFun exit. A runtime
+`app.redacted.json` snapshot is captured under
 `agent/bitfun/config/`; its selected primary/fast model configuration and
 redacted-config SHA-256 are placed in trial metadata. Credentials are never
 copied into the trial artifacts.

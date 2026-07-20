@@ -103,11 +103,12 @@ LOG_DIR={shlex.quote(log_dir)}
 mkdir -p "$LOG_DIR"
 if ! git rev-parse --show-toplevel >/dev/null 2>&1; then
   echo "not-a-git-repository" > "$LOG_DIR/git-{phase}.error.txt"
+  cat "$LOG_DIR/git-{phase}.error.txt"
   exit 0
 fi
-git rev-parse HEAD > "$LOG_DIR/git-head.{phase}.txt" 2>/dev/null || true
-git status --porcelain=v1 > "$LOG_DIR/git-status.{phase}.txt" 2>/dev/null || true
-git log --oneline --decorate -n 20 > "$LOG_DIR/git-log.{phase}.txt" 2>/dev/null || true
+git rev-parse HEAD 2>&1 | tee "$LOG_DIR/git-head.{phase}.txt" || true
+git status --porcelain=v1 2>&1 | tee "$LOG_DIR/git-status.{phase}.txt" || true
+git log --oneline --decorate -n 20 2>&1 | tee "$LOG_DIR/git-log.{phase}.txt" || true
 exit 0
 """
 
@@ -155,6 +156,7 @@ printf '{{"sessions":%s,"request_traces":%s,"token_usage":%s,"cli_logs":%s,"cli_
   "$([ -f "$BITFUN_DIR/cli.log" ] && printf true || printf false)" \\
   "$([ -f "$BITFUN_DIR/ai-request-audit.jsonl" ] && printf true || printf false)" \\
   > "$BITFUN_DIR/cp-back-manifest.json" 2>/dev/null || true
+cat "$BITFUN_DIR/cp-back-manifest.json" 2>/dev/null || true
 exit 0
 """
 
@@ -495,6 +497,16 @@ class BitfunCli(BaseAgent):
             raw_path.unlink(missing_ok=True)
 
     def _persist_failure_output(self, stdout: str | None, stderr: str | None) -> None:
+        self._persist_host_diagnostic("bitfun.txt", stdout, stderr, skip_empty=True)
+
+    def _persist_host_diagnostic(
+        self,
+        relative_path: str,
+        stdout: str | None,
+        stderr: str | None,
+        *,
+        skip_empty: bool = False,
+    ) -> None:
         parts: list[str] = []
         if stdout:
             parts.append(stdout)
@@ -502,11 +514,41 @@ class BitfunCli(BaseAgent):
             if parts:
                 parts.append("\n--- stderr ---\n")
             parts.append(stderr)
-        if not parts:
+        if skip_empty and not parts:
             return
-        path = self.logs_dir / "bitfun.txt"
+        path = self.logs_dir / _BITFUN_DIR / relative_path
+        if relative_path == "bitfun.txt":
+            path = self.logs_dir / relative_path
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(_format_failure_log_text("".join(parts)), errors="replace")
+
+    async def _capture_repo_state(
+        self, environment: BaseEnvironment, phase: str
+    ) -> None:
+        """Capture Git state both in the container and on Pier's host logs.
+
+        The host-side copy makes the evidence durable even when an environment
+        implementation delays or filters bind-mount propagation during teardown.
+        """
+        result = await environment.exec(
+            command=build_repo_state_capture_script(
+                f"{self._remote_bitfun_dir}/git", phase
+            ),
+            env=self._runtime_env(environment),
+        )
+        self._persist_host_diagnostic(
+            f"git/git-state.{phase}.host.txt", result.stdout, result.stderr
+        )
+
+    async def _copy_back_diagnostics(self, environment: BaseEnvironment) -> None:
+        """Run the in-container cp-back and retain its manifest on the host."""
+        result = await environment.exec(
+            command=_build_cp_back_command(EnvironmentPaths.agent_dir.as_posix()),
+            env=self._runtime_env(environment),
+        )
+        self._persist_host_diagnostic(
+            "cp-back-manifest.host.json", result.stdout, result.stderr
+        )
 
     async def run(
         self,
@@ -526,11 +568,7 @@ class BitfunCli(BaseAgent):
         try:
             await self._configure_pier_egress_proxy(environment)
             self._update_context_metadata(context)
-            await self._exec_checked(
-                environment,
-                label="baseline capture",
-                command=build_repo_state_capture_script(git_dir, "before"),
-            )
+            await self._capture_repo_state(environment, "before")
             command = (
                 "set -o pipefail\n"
                 f"mkdir -p {shlex.quote(EnvironmentPaths.agent_dir.as_posix())}\n"
@@ -554,19 +592,11 @@ class BitfunCli(BaseAgent):
                 )
         finally:
             try:
-                await environment.exec(
-                    command=build_repo_state_capture_script(git_dir, "after"),
-                    env=self._runtime_env(environment),
-                )
+                await self._capture_repo_state(environment, "after")
             except Exception as exc:
                 self.logger.debug("BitFun final Git evidence capture failed: %s", exc)
             try:
-                await environment.exec(
-                    command=_build_cp_back_command(
-                        EnvironmentPaths.agent_dir.as_posix()
-                    ),
-                    env=self._runtime_env(environment),
-                )
+                await self._copy_back_diagnostics(environment)
             except Exception as exc:
                 self.logger.debug("BitFun diagnostics cp-back failed: %s", exc)
             try:

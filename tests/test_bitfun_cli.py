@@ -42,6 +42,12 @@ class FakeEnvironment:
 
     async def exec(self, *, command: str, env: dict[str, str]):
         self.calls.append((command, env))
+        if "git-head.before.txt" in command:
+            return ExecResult(stdout="before-head\n", return_code=0)
+        if "git-head.after.txt" in command:
+            return ExecResult(stdout="after-head\n", return_code=0)
+        if "cp-back-manifest.json" in command:
+            return ExecResult(stdout='{"sessions":false}\n', return_code=0)
         if "CONFIG_PATH" in command:
             return ExecResult(
                 stdout="path=/testbed/.config/bitfun/config/app.json\nexists=true\n",
@@ -185,6 +191,15 @@ def test_run_preserves_diagnostics_and_runtime_config(tmp_path: Path):
     assert any("git-head.before.txt" in command for command in commands)
     assert any("git-head.after.txt" in command for command in commands)
     assert any("cp-back-manifest.json" in command for command in commands)
+    assert (
+        tmp_path / "bitfun/git/git-state.before.host.txt"
+    ).read_text() == "before-head\n"
+    assert (
+        tmp_path / "bitfun/git/git-state.after.host.txt"
+    ).read_text() == "after-head\n"
+    assert (
+        tmp_path / "bitfun/cp-back-manifest.host.json"
+    ).read_text() == '{"sessions":false}\n'
     metadata = context.metadata["bitfun_cli"]
     assert metadata["model_endpoint_domains"] == ["gateway.example.com"]
     assert metadata["runtime_config"]["default_models"] == {
@@ -210,6 +225,9 @@ def test_cli_failure_persists_output_runs_finally_and_raises_pier_error(tmp_path
     commands = [command for command, _ in environment.calls]
     assert any("git-head.after.txt" in command for command in commands)
     assert any("cp-back-manifest.json" in command for command in commands)
+    assert (
+        tmp_path / "bitfun/git/git-state.after.host.txt"
+    ).read_text() == "after-head\n"
 
 
 def test_pier_proxy_is_projected_into_an_isolated_redacted_runtime_config(
