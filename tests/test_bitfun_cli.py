@@ -19,14 +19,26 @@ from pier.models.agent.context import AgentContext
 
 
 class FakeEnvironment:
-    def __init__(self, *, allow_internet: bool = False, fail_cli: bool = False):
+    def __init__(
+        self,
+        *,
+        allow_internet: bool = False,
+        fail_cli: bool = False,
+        proxy_url: str | None = None,
+    ):
         self.task_env_config = SimpleNamespace(allow_internet=allow_internet)
         self.fail_cli = fail_cli
+        self.proxy_url = proxy_url
         self.calls: list[tuple[str, dict[str, str]]] = []
         self.uploads: dict[str, str] = {}
 
     def agent_process_env(self, env: dict[str, str]) -> dict[str, str]:
-        return {"PIER_NETWORK_PROXY": "enabled", **env}
+        proxy_env = (
+            {"HTTP_PROXY": self.proxy_url, "HTTPS_PROXY": self.proxy_url}
+            if self.proxy_url
+            else {}
+        )
+        return {"PIER_NETWORK_PROXY": "enabled", **proxy_env, **env}
 
     async def exec(self, *, command: str, env: dict[str, str]):
         self.calls.append((command, env))
@@ -48,6 +60,9 @@ class FakeEnvironment:
         return ExecResult(stdout="", return_code=0)
 
     async def download_file(self, source_path: str, target_path: Path):
+        if source_path in self.uploads:
+            Path(target_path).write_text(self.uploads[source_path])
+            return
         Path(target_path).write_text(
             json.dumps(
                 {
@@ -195,6 +210,32 @@ def test_cli_failure_persists_output_runs_finally_and_raises_pier_error(tmp_path
     commands = [command for command, _ in environment.calls]
     assert any("git-head.after.txt" in command for command in commands)
     assert any("cp-back-manifest.json" in command for command in commands)
+
+
+def test_pier_proxy_is_projected_into_an_isolated_redacted_runtime_config(
+    tmp_path: Path,
+):
+    agent = BitfunCli(
+        logs_dir=tmp_path,
+        model_endpoint_urls=["https://gateway.example.com/v1"],
+        extra_env={"XDG_CONFIG_HOME": "/testbed/.config"},
+    )
+    environment = FakeEnvironment(
+        proxy_url="http://agent:proxy-secret@pier-egress-proxy:8080"
+    )
+    context = AgentContext()
+
+    asyncio.run(agent.run("Fix the failing test.", environment, context))
+
+    projected = json.loads(
+        environment.uploads["/tmp/pier-bitfun-config/bitfun/config/app.json"]
+    )
+    assert projected["ai"]["proxy"]["enabled"] is True
+    assert projected["ai"]["proxy"]["url"] == "http://pier-egress-proxy:8080"
+    assert context.metadata["bitfun_cli"]["pier_egress_proxy_configured"] is True
+    redacted = environment.uploads["/logs/agent/bitfun/config/app.redacted.json"]
+    assert "proxy-secret" not in redacted
+    assert "[REDACTED]" in redacted
 
 
 def test_air_gapped_run_requires_a_model_endpoint(tmp_path: Path):

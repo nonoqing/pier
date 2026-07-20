@@ -152,6 +152,12 @@ non-zero BitFun exit. A runtime `app.redacted.json` snapshot is captured under
 redacted-config SHA-256 are placed in trial metadata. Credentials are never
 copied into the trial artifacts.
 
+When Pier enables its filtered egress proxy, the adapter projects its
+short-lived authenticated proxy into an isolated `/tmp` BitFun config before
+launching the CLI. BitFun otherwise intentionally ignores `HTTP(S)_PROXY`.
+The mounted worker config is not modified, and the proxy password is redacted
+from the captured runtime config.
+
 ```yaml
 agents:
   - import_path: pier.agents.installed.bitfun_cli:BitfunCli

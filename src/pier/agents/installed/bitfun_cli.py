@@ -14,6 +14,7 @@ import tempfile
 from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote, urlsplit
 
 from pier.agents.base import BaseAgent
 from pier.agents.installed.base import NonZeroAgentExitCodeError
@@ -53,6 +54,7 @@ _SENSITIVE_CONFIG_KEYS = frozenset(
     }
 )
 _SENSITIVE_CONFIG_SUFFIXES = ("_secret", "_password", "_private_key")
+_PIER_RUNTIME_CONFIG_HOME = "/tmp/pier-bitfun-config"
 
 
 def _format_failure_log_text(text: str) -> str:
@@ -206,6 +208,8 @@ class BitfunCli(BaseAgent):
         self._version = version
         self._binary_sha256: str | None = None
         self._runtime_config_metadata: dict[str, Any] | None = None
+        self._effective_xdg_config_home: str | None = None
+        self._pier_egress_proxy_configured = False
         super().__init__(logs_dir=logs_dir, model_name=model_name, **kwargs)
 
     @staticmethod
@@ -225,7 +229,10 @@ class BitfunCli(BaseAgent):
         return allowlist_from_urls(self._endpoint_values())
 
     def _runtime_env(self, environment: BaseEnvironment) -> dict[str, str]:
-        return environment.agent_process_env(self._extra_env)
+        env = dict(environment.agent_process_env(self._extra_env) or {})
+        if self._effective_xdg_config_home is not None:
+            env["XDG_CONFIG_HOME"] = self._effective_xdg_config_home
+        return env
 
     def _instruction_for(self, environment: BaseEnvironment, instruction: str) -> str:
         if (
@@ -292,6 +299,7 @@ class BitfunCli(BaseAgent):
             "stdout_path": "agent/bitfun.txt",
             "diagnostics_path": "agent/bitfun",
             "git_evidence_path": "agent/bitfun/git",
+            "pier_egress_proxy_configured": self._pier_egress_proxy_configured,
         }
         if self._runtime_config_metadata is not None:
             metadata["runtime_config"] = self._runtime_config_metadata
@@ -368,6 +376,65 @@ class BitfunCli(BaseAgent):
             "default_models": selected_ids,
             "selected_models": selected_models,
         }
+
+    async def _configure_pier_egress_proxy(self, environment: BaseEnvironment) -> None:
+        """Project Pier's authenticated proxy into an isolated BitFun config.
+
+        BitFun deliberately disables environment-derived proxies unless
+        ``ai.proxy`` is enabled. Pier's isolated environment injects the proxy
+        URL through ``HTTPS_PROXY``; copying the mounted runtime config to
+        ``/tmp`` lets this adapter enable that proxy without mutating the
+        worker's persistent BitFun configuration or retaining proxy credentials.
+        """
+        base_env = self._runtime_env(environment)
+        proxy_raw = base_env.get("HTTPS_PROXY") or base_env.get("HTTP_PROXY")
+        if not proxy_raw:
+            return
+        parsed = urlsplit(proxy_raw)
+        if not parsed.scheme or not parsed.hostname or not parsed.username:
+            raise ValueError("Pier egress proxy URL is missing a host or username")
+        try:
+            port_suffix = f":{parsed.port}" if parsed.port is not None else ""
+        except ValueError as exc:
+            raise ValueError("Pier egress proxy URL has an invalid port") from exc
+        source_home = self._extra_env.get("XDG_CONFIG_HOME", "/root/.config")
+        source_path = f"{source_home.rstrip('/')}/bitfun/config/app.json"
+        target_path = f"{_PIER_RUNTIME_CONFIG_HOME}/bitfun/config/app.json"
+
+        self.logs_dir.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            prefix=".bitfun-proxy-config-",
+            suffix=".json",
+            dir=self.logs_dir,
+            delete=False,
+        ) as raw_file:
+            raw_path = Path(raw_file.name)
+        try:
+            await environment.download_file(source_path, raw_path)
+            config = json.loads(raw_path.read_text())
+            if not isinstance(config, dict):
+                raise ValueError("BitFun runtime app config is not a JSON object")
+            ai = config.setdefault("ai", {})
+            if not isinstance(ai, dict):
+                raise ValueError("BitFun runtime app config has an invalid ai section")
+            ai["proxy"] = {
+                "enabled": True,
+                "url": f"{parsed.scheme}://{parsed.hostname}{port_suffix}",
+                "username": unquote(parsed.username),
+                "password": unquote(parsed.password or ""),
+            }
+            raw_path.write_text(json.dumps(config, indent=2) + "\n")
+            mkdir_result = await environment.exec(
+                command=f"mkdir -p {shlex.quote(str(Path(target_path).parent))}",
+                env=base_env,
+            )
+            if mkdir_result.return_code != 0:
+                raise RuntimeError("could not create isolated BitFun config directory")
+            await environment.upload_file(raw_path, target_path)
+            self._effective_xdg_config_home = _PIER_RUNTIME_CONFIG_HOME
+            self._pier_egress_proxy_configured = True
+        finally:
+            raw_path.unlink(missing_ok=True)
 
     async def _capture_final_config(self, environment: BaseEnvironment) -> None:
         """Persist only a redacted runtime config and expose a safe summary."""
@@ -455,9 +522,10 @@ class BitfunCli(BaseAgent):
                 "model_endpoint_urls or a BitFun provider base URL is required "
                 "for an air-gapped BitFun Pier run"
             )
-        self._update_context_metadata(context)
         git_dir = f"{self._remote_bitfun_dir}/git"
         try:
+            await self._configure_pier_egress_proxy(environment)
+            self._update_context_metadata(context)
             await self._exec_checked(
                 environment,
                 label="baseline capture",
