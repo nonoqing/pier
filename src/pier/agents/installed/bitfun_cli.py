@@ -628,7 +628,7 @@ class BitfunCli(BaseAgent):
             try:
                 with tarfile.open(archive, "r:gz") as bundle:
                     for member in bundle.getmembers():
-                        if not member.isfile() or "/request-traces/" not in member.name:
+                        if not member.isfile() or "request-traces/" not in member.name:
                             continue
                         handle = bundle.extractfile(member)
                         if handle is None:
