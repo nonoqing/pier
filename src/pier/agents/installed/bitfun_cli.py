@@ -55,6 +55,7 @@ _SENSITIVE_CONFIG_KEYS = frozenset(
 )
 _SENSITIVE_CONFIG_SUFFIXES = ("_secret", "_password", "_private_key")
 _PIER_RUNTIME_CONFIG_HOME = "/tmp/pier-bitfun-config"
+_TELEMETRY_MODE = "full"
 
 
 def _format_failure_log_text(text: str) -> str:
@@ -121,11 +122,15 @@ BITFUN_DIR="$LOG_DIR/{_BITFUN_DIR}"
 mkdir -p "$BITFUN_DIR/sessions"
 PROJECT_PATH=""
 for d in "$HOME/.bitfun/projects/testbed" "$HOME/.bitfun/projects/-testbed"; do
-  [ -d "$d/sessions" ] && PROJECT_PATH="$d" && break
+  {{ [ -d "$d/sessions" ] || [ -d "$d/request-traces" ]; }} && PROJECT_PATH="$d" && break
 done
 if [ -z "$PROJECT_PATH" ]; then
   LATEST_SESSIONS=$(ls -dt "$HOME"/.bitfun/projects/*/sessions/ 2>/dev/null | head -1)
   [ -n "$LATEST_SESSIONS" ] && PROJECT_PATH=$(dirname "${{LATEST_SESSIONS%/}}")
+fi
+if [ -z "$PROJECT_PATH" ]; then
+  LATEST_TRACES=$(ls -dt "$HOME"/.bitfun/projects/*/request-traces/ 2>/dev/null | head -1)
+  [ -n "$LATEST_TRACES" ] && PROJECT_PATH=$(dirname "${{LATEST_TRACES%/}}")
 fi
 if [ -n "$PROJECT_PATH" ] && [ -d "$PROJECT_PATH/sessions" ]; then
   cp -R "$PROJECT_PATH/sessions"/. "$BITFUN_DIR/sessions/" 2>/dev/null || true
@@ -212,6 +217,7 @@ class BitfunCli(BaseAgent):
         self._runtime_config_metadata: dict[str, Any] | None = None
         self._effective_xdg_config_home: str | None = None
         self._pier_egress_proxy_configured = False
+        self._telemetry_metadata: dict[str, Any] | None = None
         super().__init__(logs_dir=logs_dir, model_name=model_name, **kwargs)
 
     @staticmethod
@@ -305,6 +311,8 @@ class BitfunCli(BaseAgent):
         }
         if self._runtime_config_metadata is not None:
             metadata["runtime_config"] = self._runtime_config_metadata
+        if self._telemetry_metadata is not None:
+            metadata["telemetry"] = self._telemetry_metadata
         return metadata
 
     def _update_context_metadata(self, context: AgentContext) -> None:
@@ -438,6 +446,46 @@ class BitfunCli(BaseAgent):
         finally:
             raw_path.unlink(missing_ok=True)
 
+    async def _configure_telemetry(self, environment: BaseEnvironment) -> None:
+        """Enable full request tracing in the isolated evaluation config only."""
+        base_env = self._runtime_env(environment)
+        source_home = self._effective_xdg_config_home or self._extra_env.get(
+            "XDG_CONFIG_HOME", "/root/.config"
+        )
+        source_path = f"{source_home.rstrip('/')}/bitfun/config/app.json"
+        target_path = f"{_PIER_RUNTIME_CONFIG_HOME}/bitfun/config/app.json"
+        self.logs_dir.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            prefix=".bitfun-telemetry-config-",
+            suffix=".json",
+            dir=self.logs_dir,
+            delete=False,
+        ) as raw_file:
+            raw_path = Path(raw_file.name)
+        try:
+            await environment.download_file(source_path, raw_path)
+            config = json.loads(raw_path.read_text())
+            if not isinstance(config, dict):
+                raise ValueError("BitFun runtime app config is not a JSON object")
+            app = config.setdefault("app", {})
+            if not isinstance(app, dict):
+                raise ValueError("BitFun runtime app config has an invalid app section")
+            logging = app.setdefault("logging", {})
+            if not isinstance(logging, dict):
+                raise ValueError("BitFun runtime app config has an invalid logging section")
+            logging["model_exchange_tracing"] = {"mode": _TELEMETRY_MODE}
+            raw_path.write_text(json.dumps(config, indent=2) + "\n")
+            mkdir_result = await environment.exec(
+                command=f"mkdir -p {shlex.quote(str(Path(target_path).parent))}",
+                env=base_env,
+            )
+            if mkdir_result.return_code != 0:
+                raise RuntimeError("could not create isolated BitFun telemetry config")
+            await environment.upload_file(raw_path, target_path)
+            self._effective_xdg_config_home = _PIER_RUNTIME_CONFIG_HOME
+        finally:
+            raw_path.unlink(missing_ok=True)
+
     async def _capture_final_config(self, environment: BaseEnvironment) -> None:
         """Persist only a redacted runtime config and expose a safe summary."""
         probe = await environment.exec(
@@ -498,6 +546,95 @@ class BitfunCli(BaseAgent):
 
     def _persist_failure_output(self, stdout: str | None, stderr: str | None) -> None:
         self._persist_host_diagnostic("bitfun.txt", stdout, stderr, skip_empty=True)
+
+    def _persist_success_trace(self, stdout: str | None, stderr: str | None) -> None:
+        """Persist full stream-json events; do not apply failure-log truncation."""
+        payload = "".join(part for part in (stdout, stderr) if part)
+        if payload:
+            path = self.logs_dir / _BITFUN_DIR / "exec-events.jsonl"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(payload, errors="replace")
+        self._telemetry_metadata = {
+            "mode": _TELEMETRY_MODE,
+            "events_path": "agent/bitfun/exec-events.jsonl",
+            "request_traces_path": "agent/bitfun/request-traces",
+        }
+
+    @staticmethod
+    def _telemetry_int(usage: dict[str, Any], *keys: str) -> int | None:
+        for key in keys:
+            value = usage.get(key)
+            if isinstance(value, int) and not isinstance(value, bool):
+                return value
+        return None
+
+    def _finalize_telemetry(self, context: AgentContext) -> None:
+        """Map persisted stream events and request traces to Pier result fields."""
+        root = self.logs_dir / _BITFUN_DIR
+        event_count = 0
+        tool_calls = 0
+        events = root / "exec-events.jsonl"
+        if events.is_file():
+            for line in events.read_text(errors="replace").splitlines():
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(event, dict):
+                    event_count += 1
+                    if event.get("type") in {"tool_start", "subagent_tool_start"}:
+                        tool_calls += 1
+
+        requests = 0
+        rounds: set[str] = set()
+        input_tokens = output_tokens = cache_tokens = 0
+        usage_records = 0
+        for trace in root.glob("request-traces/**/*.json"):
+            try:
+                record = json.loads(trace.read_text())
+            except (OSError, json.JSONDecodeError):
+                continue
+            if not isinstance(record, dict):
+                continue
+            requests += 1
+            operation_id = record.get("operation_id")
+            if isinstance(operation_id, str) and operation_id:
+                rounds.add(operation_id)
+            response = record.get("response")
+            usage = response.get("usage") if isinstance(response, dict) else None
+            if not isinstance(usage, dict):
+                continue
+            usage_records += 1
+            input_tokens += self._telemetry_int(
+                usage, "prompt_tokens", "input_tokens", "prompt_token_count"
+            ) or 0
+            output_tokens += self._telemetry_int(
+                usage, "completion_tokens", "output_tokens", "candidates_token_count"
+            ) or 0
+            details = usage.get("prompt_tokens_details")
+            cache_tokens += self._telemetry_int(
+                details if isinstance(details, dict) else {},
+                "cached_tokens", "cache_read_input_tokens", "cached_content_token_count",
+            ) or self._telemetry_int(
+                usage, "cache_tokens", "cached_tokens", "cache_read_input_tokens"
+            ) or 0
+
+        self._telemetry_metadata = {
+            "mode": _TELEMETRY_MODE,
+            "events_path": "agent/bitfun/exec-events.jsonl",
+            "request_traces_path": "agent/bitfun/request-traces",
+            "stream_event_count": event_count,
+            "tool_calls": tool_calls,
+            "model_requests": requests,
+            "model_rounds": len(rounds),
+            "usage_records": usage_records,
+        }
+        if rounds:
+            context.n_agent_steps = len(rounds)
+        if usage_records:
+            context.n_input_tokens = input_tokens
+            context.n_output_tokens = output_tokens
+            context.n_cache_tokens = cache_tokens
 
     def _persist_host_diagnostic(
         self,
@@ -567,6 +704,7 @@ class BitfunCli(BaseAgent):
         git_dir = f"{self._remote_bitfun_dir}/git"
         try:
             await self._configure_pier_egress_proxy(environment)
+            await self._configure_telemetry(environment)
             self._update_context_metadata(context)
             await self._capture_repo_state(environment, "before")
             command = (
@@ -577,13 +715,14 @@ class BitfunCli(BaseAgent):
                 "else\n"
                 f"  bitfun_tee() {{ tee {shlex.quote(self._remote_agent_log)}; }}\n"
                 "fi\n"
-                f"{shlex.quote(self._binary_path)} exec --agent {shlex.quote(self._exec_agent)} -- "
+                f"{shlex.quote(self._binary_path)} exec --output-format stream-json --agent {shlex.quote(self._exec_agent)} -- "
                 f"{shlex.quote(self._instruction_for(environment, instruction))} "
                 "2>&1 | bitfun_tee\n"
                 "rc=${PIPESTATUS[0]}\n"
                 "exit $rc"
             )
-            await self._exec_checked(environment, label="CLI", command=command)
+            result = await self._exec_checked(environment, label="CLI", command=command)
+            self._persist_success_trace(result.stdout, result.stderr)
             if self._commit_final_changes:
                 await self._exec_checked(
                     environment,
@@ -599,6 +738,7 @@ class BitfunCli(BaseAgent):
                 await self._copy_back_diagnostics(environment)
             except Exception as exc:
                 self.logger.debug("BitFun diagnostics cp-back failed: %s", exc)
+            self._finalize_telemetry(context)
             try:
                 await self._capture_final_config(environment)
             except Exception as exc:

@@ -188,6 +188,7 @@ def test_run_preserves_diagnostics_and_runtime_config(tmp_path: Path):
     run_command = next(command for command in commands if "bitfun-cli exec" in command)
     assert _NETWORK_POLICY_PREAMBLE in run_command
     assert "stdbuf -oL tee" in run_command
+    assert "--output-format stream-json" in run_command
     assert any("git-head.before.txt" in command for command in commands)
     assert any("git-head.after.txt" in command for command in commands)
     assert any("cp-back-manifest.json" in command for command in commands)
@@ -206,7 +207,8 @@ def test_run_preserves_diagnostics_and_runtime_config(tmp_path: Path):
         "primary": "deepseek-v4-pro",
         "fast": "deepseek-v4-pro",
     }
-    uploaded = next(iter(environment.uploads.values()))
+    assert metadata["telemetry"]["mode"] == "full"
+    uploaded = environment.uploads["/logs/agent/bitfun/config/app.redacted.json"]
     assert "must-not-leak" not in uploaded
     assert "[REDACTED]" in uploaded
 
@@ -251,6 +253,7 @@ def test_pier_proxy_is_projected_into_an_isolated_redacted_runtime_config(
     assert projected["ai"]["proxy"]["enabled"] is True
     assert projected["ai"]["proxy"]["url"] == "http://pier-egress-proxy:8080"
     assert context.metadata["bitfun_cli"]["pier_egress_proxy_configured"] is True
+    assert projected["app"]["logging"]["model_exchange_tracing"] == {"mode": "full"}
     redacted = environment.uploads["/logs/agent/bitfun/config/app.redacted.json"]
     assert "proxy-secret" not in redacted
     assert "[REDACTED]" in redacted
@@ -263,3 +266,38 @@ def test_air_gapped_run_requires_a_model_endpoint(tmp_path: Path):
         asyncio.run(
             agent.run("Fix the failing test.", FakeEnvironment(), AgentContext())
         )
+
+
+def test_finalize_telemetry_maps_events_and_usage_to_agent_context(tmp_path: Path):
+    telemetry_dir = tmp_path / "bitfun"
+    telemetry_dir.mkdir()
+    (telemetry_dir / "exec-events.jsonl").write_text(
+        '{"type":"tool_start"}\n{"type":"subagent_tool_start"}\n'
+    )
+    traces = telemetry_dir / "request-traces" / "session"
+    traces.mkdir(parents=True)
+    (traces / "000001.json").write_text(
+        json.dumps(
+            {
+                "operation_id": "round-1",
+                "response": {
+                    "usage": {
+                        "prompt_tokens": 12,
+                        "completion_tokens": 3,
+                        "prompt_tokens_details": {"cached_tokens": 2},
+                    }
+                },
+            }
+        )
+    )
+    context = AgentContext()
+
+    agent = BitfunCli(logs_dir=tmp_path)
+    agent._finalize_telemetry(context)
+
+    assert context.n_agent_steps == 1
+    assert context.n_input_tokens == 12
+    assert context.n_output_tokens == 3
+    assert context.n_cache_tokens == 2
+    assert context.metadata is None
+    assert agent._telemetry_metadata["tool_calls"] == 2
