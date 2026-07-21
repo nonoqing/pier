@@ -610,17 +610,29 @@ class BitfunCli(BaseAgent):
                 continue
             usage_records += 1
             input_tokens += self._telemetry_int(
-                usage, "prompt_tokens", "input_tokens", "prompt_token_count"
+                usage,
+                "prompt_tokens",
+                "input_tokens",
+                "prompt_token_count",
+                "promptTokenCount",
             ) or 0
             output_tokens += self._telemetry_int(
-                usage, "completion_tokens", "output_tokens", "candidates_token_count"
+                usage,
+                "completion_tokens",
+                "output_tokens",
+                "candidates_token_count",
+                "candidatesTokenCount",
             ) or 0
             details = usage.get("prompt_tokens_details")
             cache_tokens += self._telemetry_int(
                 details if isinstance(details, dict) else {},
                 "cached_tokens", "cache_read_input_tokens", "cached_content_token_count",
             ) or self._telemetry_int(
-                usage, "cache_tokens", "cached_tokens", "cache_read_input_tokens"
+                usage,
+                "cache_tokens",
+                "cached_tokens",
+                "cache_read_input_tokens",
+                "cachedContentTokenCount",
             ) or 0
 
         archive = root / "request-traces.tar.gz"
@@ -646,17 +658,29 @@ class BitfunCli(BaseAgent):
                             continue
                         usage_records += 1
                         input_tokens += self._telemetry_int(
-                            usage, "prompt_tokens", "input_tokens", "prompt_token_count"
+                            usage,
+                            "prompt_tokens",
+                            "input_tokens",
+                            "prompt_token_count",
+                            "promptTokenCount",
                         ) or 0
                         output_tokens += self._telemetry_int(
-                            usage, "completion_tokens", "output_tokens", "candidates_token_count"
+                            usage,
+                            "completion_tokens",
+                            "output_tokens",
+                            "candidates_token_count",
+                            "candidatesTokenCount",
                         ) or 0
                         details = usage.get("prompt_tokens_details")
                         cache_tokens += self._telemetry_int(
                             details if isinstance(details, dict) else {},
                             "cached_tokens", "cache_read_input_tokens", "cached_content_token_count",
                         ) or self._telemetry_int(
-                            usage, "cache_tokens", "cached_tokens", "cache_read_input_tokens"
+                            usage,
+                            "cache_tokens",
+                            "cached_tokens",
+                            "cache_read_input_tokens",
+                            "cachedContentTokenCount",
                         ) or 0
             except (OSError, tarfile.TarError, json.JSONDecodeError):
                 pass

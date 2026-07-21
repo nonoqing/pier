@@ -1,6 +1,7 @@
 import asyncio
 import json
 import subprocess
+import tarfile
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -301,3 +302,38 @@ def test_finalize_telemetry_maps_events_and_usage_to_agent_context(tmp_path: Pat
     assert context.n_cache_tokens == 2
     assert context.metadata is None
     assert agent._telemetry_metadata["tool_calls"] == 2
+
+
+def test_finalize_telemetry_maps_bitfun_archive_usage_to_agent_context(
+    tmp_path: Path,
+):
+    telemetry_dir = tmp_path / "bitfun"
+    telemetry_dir.mkdir()
+    source = tmp_path / "source.json"
+    source.write_text(
+        json.dumps(
+            {
+                "operation_id": "round-1",
+                "response": {
+                    "usage": {
+                        "promptTokenCount": 12,
+                        "candidatesTokenCount": 3,
+                        "cachedContentTokenCount": 2,
+                    }
+                },
+            }
+        )
+    )
+    with tarfile.open(telemetry_dir / "request-traces.tar.gz", "w:gz") as archive:
+        archive.add(source, arcname="request-traces/session/000001.json")
+
+    context = AgentContext()
+    agent = BitfunCli(logs_dir=tmp_path)
+    agent._finalize_telemetry(context)
+
+    assert context.n_agent_steps == 1
+    assert context.n_input_tokens == 12
+    assert context.n_output_tokens == 3
+    assert context.n_cache_tokens == 2
+    assert agent._telemetry_metadata["model_requests"] == 1
+    assert agent._telemetry_metadata["usage_records"] == 1
