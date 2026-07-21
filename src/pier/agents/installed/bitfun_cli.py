@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import shlex
+import tarfile
 import tempfile
 from collections.abc import Iterable
 from pathlib import Path
@@ -152,6 +153,9 @@ if [ -f "$BITFUN_CONFIG_DIR/logs/bitfun-cli.log" ]; then
 fi
 if [ -f "$BITFUN_CONFIG_DIR/logs/ai-request-audit.jsonl" ]; then
   cp "$BITFUN_CONFIG_DIR/logs/ai-request-audit.jsonl" "$BITFUN_DIR/ai-request-audit.jsonl" 2>/dev/null || true
+fi
+if command -v tar >/dev/null 2>&1 && [ -d "$BITFUN_DIR/request-traces" ]; then
+  tar -C "$BITFUN_DIR" -czf "$BITFUN_DIR/request-traces.tar.gz" request-traces 2>/dev/null || true
 fi
 printf '{{"sessions":%s,"request_traces":%s,"token_usage":%s,"cli_logs":%s,"cli_log":%s,"ai_request_audit":%s}}\n' \\
   "$([ -d "$BITFUN_DIR/sessions" ] && printf true || printf false)" \\
@@ -619,6 +623,44 @@ class BitfunCli(BaseAgent):
                 usage, "cache_tokens", "cached_tokens", "cache_read_input_tokens"
             ) or 0
 
+        archive = root / "request-traces.tar.gz"
+        if not requests and archive.is_file():
+            try:
+                with tarfile.open(archive, "r:gz") as bundle:
+                    for member in bundle.getmembers():
+                        if not member.isfile() or "/request-traces/" not in member.name:
+                            continue
+                        handle = bundle.extractfile(member)
+                        if handle is None:
+                            continue
+                        record = json.loads(handle.read())
+                        if not isinstance(record, dict):
+                            continue
+                        requests += 1
+                        operation_id = record.get("operation_id")
+                        if isinstance(operation_id, str) and operation_id:
+                            rounds.add(operation_id)
+                        response = record.get("response")
+                        usage = response.get("usage") if isinstance(response, dict) else None
+                        if not isinstance(usage, dict):
+                            continue
+                        usage_records += 1
+                        input_tokens += self._telemetry_int(
+                            usage, "prompt_tokens", "input_tokens", "prompt_token_count"
+                        ) or 0
+                        output_tokens += self._telemetry_int(
+                            usage, "completion_tokens", "output_tokens", "candidates_token_count"
+                        ) or 0
+                        details = usage.get("prompt_tokens_details")
+                        cache_tokens += self._telemetry_int(
+                            details if isinstance(details, dict) else {},
+                            "cached_tokens", "cache_read_input_tokens", "cached_content_token_count",
+                        ) or self._telemetry_int(
+                            usage, "cache_tokens", "cached_tokens", "cache_read_input_tokens"
+                        ) or 0
+            except (OSError, tarfile.TarError, json.JSONDecodeError):
+                pass
+
         self._telemetry_metadata = {
             "mode": _TELEMETRY_MODE,
             "events_path": "agent/bitfun/exec-events.jsonl",
@@ -686,6 +728,14 @@ class BitfunCli(BaseAgent):
         self._persist_host_diagnostic(
             "cp-back-manifest.host.json", result.stdout, result.stderr
         )
+        try:
+            target = self.logs_dir / _BITFUN_DIR / "request-traces.tar.gz"
+            target.parent.mkdir(parents=True, exist_ok=True)
+            await environment.download_file(
+                f"{self._remote_bitfun_dir}/request-traces.tar.gz", target
+            )
+        except Exception as exc:
+            self.logger.debug("BitFun request trace archive download failed: %s", exc)
 
     async def run(
         self,
