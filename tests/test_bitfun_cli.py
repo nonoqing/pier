@@ -190,6 +190,7 @@ def test_run_preserves_diagnostics_and_runtime_config(tmp_path: Path):
     assert _NETWORK_POLICY_PREAMBLE in run_command
     assert "stdbuf -oL tee" in run_command
     assert "--output-format stream-json" in run_command
+    assert "--verify-final-changes" in run_command
     assert any("git-head.before.txt" in command for command in commands)
     assert any("git-head.after.txt" in command for command in commands)
     assert any("cp-back-manifest.json" in command for command in commands)
@@ -204,6 +205,7 @@ def test_run_preserves_diagnostics_and_runtime_config(tmp_path: Path):
     ).read_text() == '{"sessions":false}\n'
     metadata = context.metadata["bitfun_cli"]
     assert metadata["model_endpoint_domains"] == ["gateway.example.com"]
+    assert metadata["verify_final_changes"] is True
     assert metadata["runtime_config"]["default_models"] == {
         "primary": "deepseek-v4-pro",
         "fast": "deepseek-v4-pro",

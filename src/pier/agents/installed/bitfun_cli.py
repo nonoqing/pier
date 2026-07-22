@@ -306,6 +306,7 @@ class BitfunCli(BaseAgent):
             "model_name": self.model_name,
             "model_endpoint_domains": self.network_allowlist().domains,
             "exec_agent": self._exec_agent,
+            "verify_final_changes": True,
             "commit_final_changes": self._commit_final_changes,
             "network_policy_prompt": self._network_policy_prompt,
             "stdout_path": "agent/bitfun.txt",
@@ -789,7 +790,7 @@ class BitfunCli(BaseAgent):
                 "else\n"
                 f"  bitfun_tee() {{ tee {shlex.quote(self._remote_agent_log)}; }}\n"
                 "fi\n"
-                f"{shlex.quote(self._binary_path)} exec --output-format stream-json --agent {shlex.quote(self._exec_agent)} -- "
+                f"{shlex.quote(self._binary_path)} exec --verify-final-changes --output-format stream-json --agent {shlex.quote(self._exec_agent)} -- "
                 f"{shlex.quote(self._instruction_for(environment, instruction))} "
                 "2>&1 | bitfun_tee\n"
                 "rc=${PIPESTATUS[0]}\n"
