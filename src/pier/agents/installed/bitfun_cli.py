@@ -18,12 +18,16 @@ from typing import Any
 from urllib.parse import unquote, urlsplit
 
 from pier.agents.base import BaseAgent
+from pier.agents.installed.bitfun_trajectory import (
+    convert_bitfun_stream_to_trajectory,
+)
 from pier.agents.installed.base import NonZeroAgentExitCodeError
 from pier.agents.network import allowlist_from_urls, collect_url_values
 from pier.environments.base import BaseEnvironment
 from pier.models.agent.context import AgentContext
 from pier.models.agent.network import NetworkAllowlist
 from pier.models.trial.paths import EnvironmentPaths
+from pier.utils.trajectory_utils import format_trajectory_json
 
 _NETWORK_POLICY_PREAMBLE = """Network policy for this evaluation:
 The task workspace has no general internet access. Do not use web search,
@@ -177,6 +181,8 @@ class BitfunCli(BaseAgent):
     ``/logs/artifacts/model.patch``. The optional BitFun output patch is not
     used by this adapter, avoiding a second, competing artifact path.
     """
+
+    SUPPORTS_ATIF: bool = True
 
     def __init__(
         self,
@@ -477,7 +483,9 @@ class BitfunCli(BaseAgent):
                 raise ValueError("BitFun runtime app config has an invalid app section")
             logging = app.setdefault("logging", {})
             if not isinstance(logging, dict):
-                raise ValueError("BitFun runtime app config has an invalid logging section")
+                raise ValueError(
+                    "BitFun runtime app config has an invalid logging section"
+                )
             logging["model_exchange_tracing"] = {"mode": _TELEMETRY_MODE}
             raw_path.write_text(json.dumps(config, indent=2) + "\n")
             mkdir_result = await environment.exec(
@@ -796,6 +804,43 @@ class BitfunCli(BaseAgent):
         if peak_context_tokens is not None:
             context.peak_context_tokens = peak_context_tokens
 
+    def _write_trajectory(self) -> None:
+        """Persist the BitFun stream as Harbor-compatible ATIF-v1.7 JSON."""
+        events_path = self.logs_dir / _BITFUN_DIR / "exec-events.jsonl"
+        if not events_path.is_file():
+            return
+        try:
+            trajectory = convert_bitfun_stream_to_trajectory(
+                events_path,
+                agent_version=self.version(),
+                default_model_name=self.model_name,
+                exec_agent=self._exec_agent,
+            )
+        except Exception:
+            self.logger.exception("Failed to convert BitFun stream to trajectory")
+            return
+        if trajectory is None:
+            return
+        trajectory_path = self.logs_dir / "trajectory.json"
+        try:
+            trajectory_path.write_text(
+                format_trajectory_json(trajectory.to_json_dict())
+            )
+        except OSError as exc:
+            self.logger.debug(
+                "Failed to write trajectory file %s: %s", trajectory_path, exc
+            )
+            return
+        telemetry = dict(self._telemetry_metadata or {})
+        telemetry.update(
+            {
+                "trajectory_path": "agent/trajectory.json",
+                "trajectory_schema": trajectory.schema_version,
+                "trajectory_steps": len(trajectory.steps),
+            }
+        )
+        self._telemetry_metadata = telemetry
+
     def _persist_host_diagnostic(
         self,
         relative_path: str,
@@ -889,8 +934,15 @@ class BitfunCli(BaseAgent):
                 "rc=${PIPESTATUS[0]}\n"
                 "exit $rc"
             )
-            result = await self._exec_checked(environment, label="CLI", command=command)
+            result = await environment.exec(
+                command=command, env=self._runtime_env(environment)
+            )
             self._persist_success_trace(result.stdout, result.stderr)
+            if result.return_code != 0:
+                self._persist_failure_output(result.stdout, result.stderr)
+                raise NonZeroAgentExitCodeError(
+                    f"BitFun CLI exited with {result.return_code}"
+                )
             if self._commit_final_changes:
                 await self._exec_checked(
                     environment,
@@ -907,6 +959,7 @@ class BitfunCli(BaseAgent):
             except Exception as exc:
                 self.logger.debug("BitFun diagnostics cp-back failed: %s", exc)
             self._finalize_telemetry(context)
+            self._write_trajectory()
             try:
                 await self._capture_final_config(environment)
             except Exception as exc:

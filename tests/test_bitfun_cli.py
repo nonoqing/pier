@@ -15,6 +15,9 @@ from pier.agents.installed.bitfun_cli import (
     build_commit_final_changes_script,
     build_repo_state_capture_script,
 )
+from pier.agents.installed.bitfun_trajectory import (
+    convert_bitfun_stream_to_trajectory,
+)
 from pier.environments.base import ExecResult
 from pier.models.agent.context import AgentContext
 
@@ -228,6 +231,7 @@ def test_cli_failure_persists_output_runs_finally_and_raises_pier_error(tmp_path
         asyncio.run(agent.run("Fix the failing test.", environment, AgentContext()))
 
     assert "diagnostic marker" in (tmp_path / "bitfun.txt").read_text()
+    assert "diagnostic marker" in (tmp_path / "bitfun/exec-events.jsonl").read_text()
     commands = [command for command, _ in environment.calls]
     assert any("git-head.after.txt" in command for command in commands)
     assert any("cp-back-manifest.json" in command for command in commands)
@@ -433,3 +437,242 @@ def test_finalize_telemetry_maps_bitfun_archive_usage_to_agent_context(
     assert context.n_cache_tokens == 2
     assert agent._telemetry_metadata["model_requests"] == 1
     assert agent._telemetry_metadata["usage_records"] == 1
+
+
+def test_convert_stream_events_to_harbor_atif(tmp_path: Path):
+    events_path = tmp_path / "exec-events.jsonl"
+    events = [
+        {
+            "timestamp": {"secs_since_epoch": 1_700_000_000, "nanos_since_epoch": 0},
+            "event": {
+                "type": "DialogTurnStarted",
+                "session_id": "session-1",
+                "turn_id": "turn-1",
+                "turn_index": 0,
+                "user_input": "Fix the test.",
+                "original_user_input": None,
+            },
+        },
+        {
+            "timestamp": {"secs_since_epoch": 1_700_000_001, "nanos_since_epoch": 0},
+            "event": {
+                "type": "ModelRoundStarted",
+                "session_id": "session-1",
+                "turn_id": "turn-1",
+                "round_id": "round-1",
+                "round_index": 0,
+                "model_config_id": "deepseek-v4-flash",
+                "effective_model_name": "deepseek-v4-flash",
+            },
+        },
+        {
+            "event": {
+                "type": "ThinkingChunk",
+                "turn_id": "turn-1",
+                "round_id": "round-1",
+                "content": "Inspect ",
+            }
+        },
+        {
+            "event": {
+                "type": "ThinkingChunk",
+                "turn_id": "turn-1",
+                "round_id": "round-1",
+                "content": "first.",
+            }
+        },
+        {
+            "event": {
+                "type": "TextChunk",
+                "turn_id": "turn-1",
+                "round_id": "round-1",
+                "text": "I will inspect it.",
+            }
+        },
+        {
+            "event": {
+                "type": "ToolEvent",
+                "turn_id": "turn-1",
+                "round_id": "round-1",
+                "attempt_id": "round-1:attempt:1",
+                "attempt_index": 1,
+                "tool_event": {
+                    "event_type": "EarlyDetected",
+                    "tool_id": "call-1",
+                    "tool_name": "Read",
+                },
+            }
+        },
+        {
+            "event": {
+                "type": "TokenUsageUpdated",
+                "turn_id": "turn-1",
+                "input_tokens": 120,
+                "output_tokens": 30,
+                "cached_tokens": 80,
+                "total_tokens": 150,
+                "max_context_tokens": 1_000_000,
+            }
+        },
+        {
+            "event": {
+                "type": "ModelRoundCompleted",
+                "turn_id": "turn-1",
+                "round_id": "round-1",
+                "has_tool_calls": True,
+                "duration_ms": 500,
+                "attempt_count": 1,
+            }
+        },
+        {
+            "timestamp": {"secs_since_epoch": 1_700_000_002, "nanos_since_epoch": 0},
+            "event": {
+                "type": "ToolEvent",
+                "turn_id": "turn-1",
+                "round_id": "round-1",
+                "attempt_id": "round-1:attempt:1",
+                "attempt_index": 1,
+                "tool_event": {
+                    "event_type": "Started",
+                    "tool_id": "call-1",
+                    "tool_name": "Read",
+                    "params": {"file_path": "/app/test.py"},
+                },
+            },
+        },
+        {
+            "event": {
+                "type": "ToolEvent",
+                "turn_id": "turn-1",
+                "round_id": "round-1",
+                "attempt_id": "round-1:attempt:1",
+                "attempt_index": 1,
+                "tool_event": {
+                    "event_type": "Completed",
+                    "tool_id": "call-1",
+                    "tool_name": "Read",
+                    "result": {"content": "hello"},
+                    "result_for_assistant": "hello",
+                    "duration_ms": 7,
+                    "execution_ms": 6,
+                },
+            }
+        },
+        {
+            "event": {
+                "type": "DialogTurnCompleted",
+                "turn_id": "turn-1",
+                "success": True,
+            }
+        },
+    ]
+    events_path.write_text(
+        "Warning: compatibility launcher\n"
+        + "\n".join(json.dumps(event) for event in events)
+        + "\n"
+    )
+
+    trajectory = convert_bitfun_stream_to_trajectory(
+        events_path,
+        agent_version="bitfun 0.3.0",
+        default_model_name=None,
+        exec_agent="agentic",
+    )
+
+    assert trajectory is not None
+    assert trajectory.schema_version == "ATIF-v1.7"
+    assert trajectory.session_id == "session-1"
+    assert trajectory.agent.model_name == "deepseek-v4-flash"
+    assert [step.source for step in trajectory.steps] == ["user", "agent", "agent"]
+    response_step, tool_step = trajectory.steps[1:]
+    assert response_step.message == "I will inspect it."
+    assert response_step.reasoning_content == "Inspect first."
+    assert response_step.llm_call_count == 1
+    assert response_step.metrics.prompt_tokens == 120
+    assert tool_step.llm_call_count == 0
+    assert tool_step.tool_calls[0].arguments == {"file_path": "/app/test.py"}
+    assert tool_step.observation.results[0].source_call_id == "call-1"
+    assert tool_step.observation.results[0].content == "hello"
+    assert trajectory.final_metrics.total_prompt_tokens == 120
+    assert trajectory.final_metrics.total_completion_tokens == 30
+    assert trajectory.final_metrics.total_cached_tokens == 80
+    assert trajectory.final_metrics.extra["llm_call_count"] == 1
+    assert trajectory.final_metrics.extra["tool_calls"] == 1
+
+
+def test_convert_failed_tool_uses_partial_arguments_and_single_llm_call(
+    tmp_path: Path,
+):
+    events_path = tmp_path / "exec-events.jsonl"
+    events = [
+        {
+            "event": {
+                "type": "DialogTurnStarted",
+                "session_id": "session-1",
+                "turn_id": "turn-1",
+                "user_input": "Read a missing file.",
+            }
+        },
+        {
+            "event": {
+                "type": "ModelRoundStarted",
+                "turn_id": "turn-1",
+                "round_id": "round-1",
+                "effective_model_name": "model-1",
+            }
+        },
+        {
+            "event": {
+                "type": "ThinkingChunk",
+                "turn_id": "turn-1",
+                "round_id": "round-1",
+                "content": "Try it.",
+            }
+        },
+        *[
+            {
+                "event": {
+                    "type": "ToolEvent",
+                    "turn_id": "turn-1",
+                    "round_id": "round-1",
+                    "tool_event": {
+                        "event_type": "ParamsPartial",
+                        "tool_id": "call-1",
+                        "tool_name": "Read",
+                        "params": chunk,
+                    },
+                }
+            }
+            for chunk in ['{"file_path":', '"/missing"}']
+        ],
+        {
+            "event": {
+                "type": "ToolEvent",
+                "turn_id": "turn-1",
+                "round_id": "round-1",
+                "tool_event": {
+                    "event_type": "Failed",
+                    "tool_id": "call-1",
+                    "tool_name": "Read",
+                    "error": "File does not exist",
+                },
+            }
+        },
+    ]
+    events_path.write_text("\n".join(json.dumps(event) for event in events) + "\n")
+
+    trajectory = convert_bitfun_stream_to_trajectory(
+        events_path,
+        agent_version=None,
+        default_model_name=None,
+        exec_agent="agentic",
+    )
+
+    assert trajectory is not None
+    assert len(trajectory.steps) == 2
+    tool_step = trajectory.steps[1]
+    assert tool_step.llm_call_count == 1
+    assert tool_step.reasoning_content == "Try it."
+    assert tool_step.tool_calls[0].arguments == {"file_path": "/missing"}
+    assert tool_step.observation.results[0].content == "File does not exist"
+    assert tool_step.observation.results[0].extra["success"] is False
