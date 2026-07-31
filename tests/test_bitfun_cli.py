@@ -307,6 +307,99 @@ def test_finalize_telemetry_maps_events_and_usage_to_agent_context(tmp_path: Pat
     assert agent._telemetry_metadata["tool_calls"] == 2
 
 
+def test_finalize_telemetry_maps_stream_json_envelopes_without_request_traces(
+    tmp_path: Path,
+):
+    telemetry_dir = tmp_path / "bitfun"
+    telemetry_dir.mkdir()
+    events = [
+        {
+            "id": "round-1-start",
+            "event": {"type": "ModelRoundStarted", "round_id": "round-1"},
+        },
+        {
+            "id": "round-1-usage",
+            "event": {
+                "type": "TokenUsageUpdated",
+                "input_tokens": 12,
+                "output_tokens": 3,
+                "cached_tokens": 2,
+                "max_context_tokens": 1_000_000,
+            },
+        },
+        {
+            "id": "tool-1-early",
+            "event": {
+                "type": "ToolEvent",
+                "tool_event": {"event_type": "EarlyDetected", "tool_id": "tool-1"},
+            },
+        },
+        {
+            "id": "tool-1-complete",
+            "event": {
+                "type": "ToolEvent",
+                "tool_event": {"event_type": "Completed", "tool_id": "tool-1"},
+            },
+        },
+        {
+            "id": "round-1-complete",
+            "event": {"type": "ModelRoundCompleted", "round_id": "round-1"},
+        },
+        {
+            "id": "round-2-start",
+            "event": {"type": "ModelRoundStarted", "round_id": "round-2"},
+        },
+        {
+            "id": "round-2-usage",
+            "event": {
+                "type": "TokenUsageUpdated",
+                "input_tokens": 20,
+                "output_tokens": 5,
+                "cached_tokens": 4,
+                "max_context_tokens": 1_000_000,
+            },
+        },
+        {
+            "id": "tool-2-early",
+            "event": {
+                "type": "ToolEvent",
+                "tool_event": {"event_type": "EarlyDetected", "tool_id": "tool-2"},
+            },
+        },
+        {
+            "id": "tool-2-failed",
+            "event": {
+                "type": "ToolEvent",
+                "tool_event": {"event_type": "Failed", "tool_id": "tool-2"},
+            },
+        },
+        {
+            "id": "round-2-complete",
+            "event": {"type": "ModelRoundCompleted", "round_id": "round-2"},
+        },
+    ]
+    (telemetry_dir / "exec-events.jsonl").write_text(
+        "Warning: compatibility launcher\n"
+        + "\n".join(json.dumps(event) for event in events)
+        + "\n"
+    )
+    context = AgentContext()
+
+    agent = BitfunCli(logs_dir=tmp_path)
+    agent._finalize_telemetry(context)
+
+    assert context.n_agent_steps == 2
+    assert context.n_input_tokens == 32
+    assert context.n_output_tokens == 8
+    assert context.n_cache_tokens == 6
+    assert context.peak_context_tokens == 20
+    assert agent._telemetry_metadata["stream_event_count"] == len(events)
+    assert agent._telemetry_metadata["tool_calls"] == 2
+    assert agent._telemetry_metadata["model_requests"] == 2
+    assert agent._telemetry_metadata["model_rounds"] == 2
+    assert agent._telemetry_metadata["usage_records"] == 2
+
+
 def test_finalize_telemetry_maps_bitfun_archive_usage_to_agent_context(
     tmp_path: Path,
 ):

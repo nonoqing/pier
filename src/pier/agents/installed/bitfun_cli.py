@@ -577,23 +577,61 @@ class BitfunCli(BaseAgent):
         """Map persisted stream events and request traces to Pier result fields."""
         root = self.logs_dir / _BITFUN_DIR
         event_count = 0
-        tool_calls = 0
+        legacy_tool_calls = 0
+        tool_call_ids: set[str] = set()
+        event_requests = 0
+        event_rounds: set[str] = set()
+        event_input_tokens = event_output_tokens = event_cache_tokens = 0
+        event_usage_records = 0
+        event_peak_context_tokens: int | None = None
         events = root / "exec-events.jsonl"
         if events.is_file():
             for line in events.read_text(errors="replace").splitlines():
                 try:
-                    event = json.loads(line)
+                    record = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                if isinstance(event, dict):
-                    event_count += 1
-                    if event.get("type") in {"tool_start", "subagent_tool_start"}:
-                        tool_calls += 1
+                if not isinstance(record, dict):
+                    continue
+                event_count += 1
+                nested_event = record.get("event")
+                event = nested_event if isinstance(nested_event, dict) else record
+                event_type = event.get("type")
+                if event_type in {"tool_start", "subagent_tool_start"}:
+                    legacy_tool_calls += 1
+                elif event_type == "ToolEvent":
+                    tool_event = event.get("tool_event")
+                    if isinstance(tool_event, dict):
+                        tool_id = tool_event.get("tool_id")
+                        if isinstance(tool_id, str) and tool_id:
+                            tool_call_ids.add(tool_id)
+                if event_type == "ModelRoundStarted":
+                    event_requests += 1
+                if event_type in {"ModelRoundStarted", "ModelRoundCompleted"}:
+                    round_id = event.get("round_id")
+                    if isinstance(round_id, str) and round_id:
+                        event_rounds.add(round_id)
+                if event_type != "TokenUsageUpdated":
+                    continue
+                event_usage_records += 1
+                round_input_tokens = self._telemetry_int(event, "input_tokens")
+                event_input_tokens += round_input_tokens or 0
+                event_output_tokens += self._telemetry_int(event, "output_tokens") or 0
+                event_cache_tokens += self._telemetry_int(event, "cached_tokens") or 0
+                if round_input_tokens is not None:
+                    event_peak_context_tokens = (
+                        round_input_tokens
+                        if event_peak_context_tokens is None
+                        else max(event_peak_context_tokens, round_input_tokens)
+                    )
+
+        tool_calls = legacy_tool_calls + len(tool_call_ids)
 
         requests = 0
         rounds: set[str] = set()
         input_tokens = output_tokens = cache_tokens = 0
         usage_records = 0
+        trace_peak_context_tokens: int | None = None
         for trace in root.glob("request-traces/**/*.json"):
             try:
                 record = json.loads(trace.read_text())
@@ -610,31 +648,47 @@ class BitfunCli(BaseAgent):
             if not isinstance(usage, dict):
                 continue
             usage_records += 1
-            input_tokens += self._telemetry_int(
+            request_input_tokens = self._telemetry_int(
                 usage,
                 "prompt_tokens",
                 "input_tokens",
                 "prompt_token_count",
                 "promptTokenCount",
-            ) or 0
-            output_tokens += self._telemetry_int(
-                usage,
-                "completion_tokens",
-                "output_tokens",
-                "candidates_token_count",
-                "candidatesTokenCount",
-            ) or 0
+            )
+            input_tokens += request_input_tokens or 0
+            if request_input_tokens is not None:
+                trace_peak_context_tokens = (
+                    request_input_tokens
+                    if trace_peak_context_tokens is None
+                    else max(trace_peak_context_tokens, request_input_tokens)
+                )
+            output_tokens += (
+                self._telemetry_int(
+                    usage,
+                    "completion_tokens",
+                    "output_tokens",
+                    "candidates_token_count",
+                    "candidatesTokenCount",
+                )
+                or 0
+            )
             details = usage.get("prompt_tokens_details")
-            cache_tokens += self._telemetry_int(
-                details if isinstance(details, dict) else {},
-                "cached_tokens", "cache_read_input_tokens", "cached_content_token_count",
-            ) or self._telemetry_int(
-                usage,
-                "cache_tokens",
-                "cached_tokens",
-                "cache_read_input_tokens",
-                "cachedContentTokenCount",
-            ) or 0
+            cache_tokens += (
+                self._telemetry_int(
+                    details if isinstance(details, dict) else {},
+                    "cached_tokens",
+                    "cache_read_input_tokens",
+                    "cached_content_token_count",
+                )
+                or self._telemetry_int(
+                    usage,
+                    "cache_tokens",
+                    "cached_tokens",
+                    "cache_read_input_tokens",
+                    "cachedContentTokenCount",
+                )
+                or 0
+            )
 
         archive = root / "request-traces.tar.gz"
         if not requests and archive.is_file():
@@ -654,37 +708,74 @@ class BitfunCli(BaseAgent):
                         if isinstance(operation_id, str) and operation_id:
                             rounds.add(operation_id)
                         response = record.get("response")
-                        usage = response.get("usage") if isinstance(response, dict) else None
+                        usage = (
+                            response.get("usage")
+                            if isinstance(response, dict)
+                            else None
+                        )
                         if not isinstance(usage, dict):
                             continue
                         usage_records += 1
-                        input_tokens += self._telemetry_int(
+                        request_input_tokens = self._telemetry_int(
                             usage,
                             "prompt_tokens",
                             "input_tokens",
                             "prompt_token_count",
                             "promptTokenCount",
-                        ) or 0
-                        output_tokens += self._telemetry_int(
-                            usage,
-                            "completion_tokens",
-                            "output_tokens",
-                            "candidates_token_count",
-                            "candidatesTokenCount",
-                        ) or 0
+                        )
+                        input_tokens += request_input_tokens or 0
+                        if request_input_tokens is not None:
+                            trace_peak_context_tokens = (
+                                request_input_tokens
+                                if trace_peak_context_tokens is None
+                                else max(
+                                    trace_peak_context_tokens, request_input_tokens
+                                )
+                            )
+                        output_tokens += (
+                            self._telemetry_int(
+                                usage,
+                                "completion_tokens",
+                                "output_tokens",
+                                "candidates_token_count",
+                                "candidatesTokenCount",
+                            )
+                            or 0
+                        )
                         details = usage.get("prompt_tokens_details")
-                        cache_tokens += self._telemetry_int(
-                            details if isinstance(details, dict) else {},
-                            "cached_tokens", "cache_read_input_tokens", "cached_content_token_count",
-                        ) or self._telemetry_int(
-                            usage,
-                            "cache_tokens",
-                            "cached_tokens",
-                            "cache_read_input_tokens",
-                            "cachedContentTokenCount",
-                        ) or 0
+                        cache_tokens += (
+                            self._telemetry_int(
+                                details if isinstance(details, dict) else {},
+                                "cached_tokens",
+                                "cache_read_input_tokens",
+                                "cached_content_token_count",
+                            )
+                            or self._telemetry_int(
+                                usage,
+                                "cache_tokens",
+                                "cached_tokens",
+                                "cache_read_input_tokens",
+                                "cachedContentTokenCount",
+                            )
+                            or 0
+                        )
             except (OSError, tarfile.TarError, json.JSONDecodeError):
                 pass
+
+        if not requests:
+            requests = event_requests
+        if not rounds:
+            rounds = event_rounds
+        peak_context_tokens = trace_peak_context_tokens
+        if not usage_records and event_usage_records:
+            input_tokens = event_input_tokens
+            output_tokens = event_output_tokens
+            cache_tokens = event_cache_tokens
+            usage_records = event_usage_records
+            peak_context_tokens = event_peak_context_tokens
+        elif peak_context_tokens is None:
+            peak_context_tokens = event_peak_context_tokens
+        model_rounds = len(rounds) or requests
 
         self._telemetry_metadata = {
             "mode": _TELEMETRY_MODE,
@@ -693,15 +784,17 @@ class BitfunCli(BaseAgent):
             "stream_event_count": event_count,
             "tool_calls": tool_calls,
             "model_requests": requests,
-            "model_rounds": len(rounds),
+            "model_rounds": model_rounds,
             "usage_records": usage_records,
         }
-        if rounds:
-            context.n_agent_steps = len(rounds)
+        if model_rounds:
+            context.n_agent_steps = model_rounds
         if usage_records:
             context.n_input_tokens = input_tokens
             context.n_output_tokens = output_tokens
             context.n_cache_tokens = cache_tokens
+        if peak_context_tokens is not None:
+            context.peak_context_tokens = peak_context_tokens
 
     def _persist_host_diagnostic(
         self,
