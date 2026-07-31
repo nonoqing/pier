@@ -141,7 +141,10 @@ the agent environment. For air-gapped tasks, pass every model endpoint URL in
 `model_endpoint_urls`; Pier derives the runtime network allowlist from those
 URLs and does not grant general internet access. The adapter prepends a stable
 network-policy reminder, then commits the task worktree only after BitFun exits
-successfully. The task's own `pre_artifacts.sh` is solely responsible for
+successfully. It invokes BitFun's non-interactive `exec` command with the
+explicit `--auto` flag so tool permissions are approved for the isolated
+evaluation task without changing BitFun's safe headless default. The task's own
+`pre_artifacts.sh` is solely responsible for
 creating `artifacts/model.patch`; the adapter never writes that artifact.
 
 The adapter retains `agent/bitfun.txt`, host-durable Git before/after evidence

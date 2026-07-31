@@ -189,6 +189,7 @@ def test_run_preserves_diagnostics_and_runtime_config(tmp_path: Path):
     run_command = next(command for command in commands if "bitfun-cli exec" in command)
     assert _NETWORK_POLICY_PREAMBLE in run_command
     assert "stdbuf -oL tee" in run_command
+    assert "exec --auto --verify-final-changes" in run_command
     assert "--output-format stream-json" in run_command
     assert "--verify-final-changes" in run_command
     assert any("git-head.before.txt" in command for command in commands)

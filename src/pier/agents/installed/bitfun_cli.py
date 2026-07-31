@@ -790,7 +790,7 @@ class BitfunCli(BaseAgent):
                 "else\n"
                 f"  bitfun_tee() {{ tee {shlex.quote(self._remote_agent_log)}; }}\n"
                 "fi\n"
-                f"{shlex.quote(self._binary_path)} exec --verify-final-changes --output-format stream-json --agent {shlex.quote(self._exec_agent)} -- "
+                f"{shlex.quote(self._binary_path)} exec --auto --verify-final-changes --output-format stream-json --agent {shlex.quote(self._exec_agent)} -- "
                 f"{shlex.quote(self._instruction_for(environment, instruction))} "
                 "2>&1 | bitfun_tee\n"
                 "rc=${PIPESTATUS[0]}\n"
