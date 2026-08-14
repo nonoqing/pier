@@ -56,6 +56,7 @@ _SENSITIVE_CONFIG_KEYS = frozenset(
 )
 _SENSITIVE_CONFIG_SUFFIXES = ("_secret", "_password", "_private_key")
 _PIER_RUNTIME_CONFIG_HOME = "/tmp/pier-bitfun-config"
+_PIER_RUNTIME_HOME = "/tmp/pier-bitfun-home"
 _TELEMETRY_MODE = "full"
 
 
@@ -120,26 +121,23 @@ def _build_cp_back_command(log_dir: str) -> str:
     return f"""set +e
 LOG_DIR={shlex.quote(log_dir)}
 BITFUN_DIR="$LOG_DIR/{_BITFUN_DIR}"
-mkdir -p "$BITFUN_DIR/sessions"
-PROJECT_PATH=""
-for d in "$HOME/.bitfun/projects/testbed" "$HOME/.bitfun/projects/-testbed"; do
-  {{ [ -d "$d/sessions" ] || [ -d "$d/request-traces" ]; }} && PROJECT_PATH="$d" && break
+mkdir -p "$BITFUN_DIR/sessions" "$BITFUN_DIR/request-traces"
+BITFUN_HOME_DIR="${{BITFUN_HOME:-$HOME/.bitfun}}"
+for PROJECT_PATH in "$BITFUN_HOME_DIR"/projects/*; do
+  [ -d "$PROJECT_PATH" ] || continue
+  if [ -d "$PROJECT_PATH/sessions" ]; then
+    cp -R "$PROJECT_PATH/sessions"/. "$BITFUN_DIR/sessions/" 2>/dev/null || true
+    for TRACE_DIR in "$PROJECT_PATH"/sessions/*/request-traces; do
+      [ -d "$TRACE_DIR" ] || continue
+      SESSION_ID=$(basename "$(dirname "$TRACE_DIR")")
+      mkdir -p "$BITFUN_DIR/request-traces/$SESSION_ID"
+      cp -R "$TRACE_DIR"/. "$BITFUN_DIR/request-traces/$SESSION_ID/" 2>/dev/null || true
+    done
+  fi
+  if [ -d "$PROJECT_PATH/request-traces" ]; then
+    cp -R "$PROJECT_PATH/request-traces"/. "$BITFUN_DIR/request-traces/" 2>/dev/null || true
+  fi
 done
-if [ -z "$PROJECT_PATH" ]; then
-  LATEST_SESSIONS=$(ls -dt "$HOME"/.bitfun/projects/*/sessions/ 2>/dev/null | head -1)
-  [ -n "$LATEST_SESSIONS" ] && PROJECT_PATH=$(dirname "${{LATEST_SESSIONS%/}}")
-fi
-if [ -z "$PROJECT_PATH" ]; then
-  LATEST_TRACES=$(ls -dt "$HOME"/.bitfun/projects/*/request-traces/ 2>/dev/null | head -1)
-  [ -n "$LATEST_TRACES" ] && PROJECT_PATH=$(dirname "${{LATEST_TRACES%/}}")
-fi
-if [ -n "$PROJECT_PATH" ] && [ -d "$PROJECT_PATH/sessions" ]; then
-  cp -R "$PROJECT_PATH/sessions"/. "$BITFUN_DIR/sessions/" 2>/dev/null || true
-fi
-if [ -n "$PROJECT_PATH" ] && [ -d "$PROJECT_PATH/request-traces" ]; then
-  mkdir -p "$BITFUN_DIR/request-traces"
-  cp -R "$PROJECT_PATH/request-traces"/. "$BITFUN_DIR/request-traces/" 2>/dev/null || true
-fi
 BITFUN_CONFIG_HOME="${{XDG_CONFIG_HOME:-$HOME/.config}}"
 BITFUN_CONFIG_DIR="$BITFUN_CONFIG_HOME/bitfun"
 if [ -d "$BITFUN_CONFIG_DIR/data/token_usage" ]; then
@@ -158,8 +156,8 @@ if command -v tar >/dev/null 2>&1 && [ -d "$BITFUN_DIR/request-traces" ]; then
   tar -C "$BITFUN_DIR" -czf "$BITFUN_DIR/request-traces.tar.gz" request-traces 2>/dev/null || true
 fi
 printf '{{"sessions":%s,"request_traces":%s,"token_usage":%s,"cli_logs":%s,"cli_log":%s,"ai_request_audit":%s}}\n' \\
-  "$([ -d "$BITFUN_DIR/sessions" ] && printf true || printf false)" \\
-  "$([ -d "$BITFUN_DIR/request-traces" ] && printf true || printf false)" \\
+  "$([ -n "$(find "$BITFUN_DIR/sessions" -type f -print -quit 2>/dev/null)" ] && printf true || printf false)" \\
+  "$([ -n "$(find "$BITFUN_DIR/request-traces" -type f -print -quit 2>/dev/null)" ] && printf true || printf false)" \\
   "$([ -d "$BITFUN_DIR/token_usage" ] && printf true || printf false)" \\
   "$([ -d "$BITFUN_DIR/cli-logs" ] && printf true || printf false)" \\
   "$([ -f "$BITFUN_DIR/cli.log" ] && printf true || printf false)" \\
@@ -246,6 +244,7 @@ class BitfunCli(BaseAgent):
 
     def _runtime_env(self, environment: BaseEnvironment) -> dict[str, str]:
         env = dict(environment.agent_process_env(self._extra_env) or {})
+        env.setdefault("BITFUN_HOME", _PIER_RUNTIME_HOME)
         if self._effective_xdg_config_home is not None:
             env["XDG_CONFIG_HOME"] = self._effective_xdg_config_home
         return env
@@ -291,7 +290,18 @@ class BitfunCli(BaseAgent):
             ),
         )
         if result.stdout and not self._version:
-            self._version = result.stdout.strip().splitlines()[0]
+            version_lines = [
+                line.strip() for line in result.stdout.splitlines() if line.strip()
+            ]
+            if version_lines:
+                self._version = next(
+                    (
+                        line
+                        for line in reversed(version_lines)
+                        if line.startswith(("bitfun ", "bitfun-cli "))
+                    ),
+                    version_lines[-1],
+                )
         checksum_result = await environment.exec(
             command=(
                 f"if command -v sha256sum >/dev/null 2>&1; then sha256sum {binary}; "
@@ -583,46 +593,87 @@ class BitfunCli(BaseAgent):
         root = self.logs_dir / _BITFUN_DIR
         event_count = 0
         tool_calls = 0
+        stream_requests = 0
+        stream_rounds: set[str] = set()
+        stream_input_tokens = stream_output_tokens = stream_cache_tokens = 0
+        stream_usage_records = 0
         events = root / "exec-events.jsonl"
         if events.is_file():
             for line in events.read_text(errors="replace").splitlines():
                 try:
-                    event = json.loads(line)
+                    record = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                if isinstance(event, dict):
-                    event_count += 1
-                    if event.get("type") in {"tool_start", "subagent_tool_start"}:
+                if not isinstance(record, dict):
+                    continue
+                event_count += 1
+                event = (
+                    record["event"]
+                    if isinstance(record.get("event"), dict)
+                    else record
+                )
+                event_type = event.get("type")
+                if event_type in {"tool_start", "subagent_tool_start"}:
+                    tool_calls += 1
+                elif event_type == "ToolEvent":
+                    tool_event = event.get("tool_event")
+                    if (
+                        isinstance(tool_event, dict)
+                        and tool_event.get("event_type") == "Started"
+                    ):
                         tool_calls += 1
 
-        requests = 0
-        rounds: set[str] = set()
-        input_tokens = output_tokens = cache_tokens = 0
-        usage_records = 0
-        for trace in root.glob("request-traces/**/*.json"):
-            try:
-                record = json.loads(trace.read_text())
-            except (OSError, json.JSONDecodeError):
-                continue
-            if not isinstance(record, dict):
-                continue
-            requests += 1
+                if event_type in {"ModelRoundStarted", "ModelRoundCompleted"}:
+                    round_id = event.get("round_id")
+                    if isinstance(round_id, str) and round_id:
+                        stream_rounds.add(round_id)
+                if event_type == "ModelRoundCompleted":
+                    attempt_count = self._telemetry_int(event, "attempt_count")
+                    stream_requests += max(attempt_count or 1, 1)
+                if event_type == "TokenUsageUpdated":
+                    stream_usage_records += 1
+                    stream_input_tokens += self._telemetry_int(
+                        event, "input_tokens"
+                    ) or 0
+                    stream_output_tokens += self._telemetry_int(
+                        event, "output_tokens"
+                    ) or 0
+                    details = event.get("token_details")
+                    stream_cache_tokens += self._telemetry_int(
+                        event, "cached_tokens", "cache_tokens"
+                    ) or self._telemetry_int(
+                        details if isinstance(details, dict) else {},
+                        "cached_tokens",
+                        "cachedTokens",
+                        "cache_read_input_tokens",
+                    ) or 0
+
+        trace_requests = 0
+        trace_rounds: set[str] = set()
+        trace_input_tokens = trace_output_tokens = trace_cache_tokens = 0
+        trace_usage_records = 0
+
+        def record_trace(record: dict[str, Any]) -> None:
+            nonlocal trace_requests
+            nonlocal trace_input_tokens, trace_output_tokens, trace_cache_tokens
+            nonlocal trace_usage_records
+            trace_requests += 1
             operation_id = record.get("operation_id")
             if isinstance(operation_id, str) and operation_id:
-                rounds.add(operation_id)
+                trace_rounds.add(operation_id)
             response = record.get("response")
             usage = response.get("usage") if isinstance(response, dict) else None
             if not isinstance(usage, dict):
-                continue
-            usage_records += 1
-            input_tokens += self._telemetry_int(
+                return
+            trace_usage_records += 1
+            trace_input_tokens += self._telemetry_int(
                 usage,
                 "prompt_tokens",
                 "input_tokens",
                 "prompt_token_count",
                 "promptTokenCount",
             ) or 0
-            output_tokens += self._telemetry_int(
+            trace_output_tokens += self._telemetry_int(
                 usage,
                 "completion_tokens",
                 "output_tokens",
@@ -630,9 +681,11 @@ class BitfunCli(BaseAgent):
                 "candidatesTokenCount",
             ) or 0
             details = usage.get("prompt_tokens_details")
-            cache_tokens += self._telemetry_int(
+            trace_cache_tokens += self._telemetry_int(
                 details if isinstance(details, dict) else {},
-                "cached_tokens", "cache_read_input_tokens", "cached_content_token_count",
+                "cached_tokens",
+                "cache_read_input_tokens",
+                "cached_content_token_count",
             ) or self._telemetry_int(
                 usage,
                 "cache_tokens",
@@ -641,8 +694,16 @@ class BitfunCli(BaseAgent):
                 "cachedContentTokenCount",
             ) or 0
 
+        for trace in root.glob("request-traces/**/*.json"):
+            try:
+                record = json.loads(trace.read_text())
+            except (OSError, json.JSONDecodeError):
+                continue
+            if isinstance(record, dict):
+                record_trace(record)
+
         archive = root / "request-traces.tar.gz"
-        if not requests and archive.is_file():
+        if not trace_requests and archive.is_file():
             try:
                 with tarfile.open(archive, "r:gz") as bundle:
                     for member in bundle.getmembers():
@@ -654,42 +715,22 @@ class BitfunCli(BaseAgent):
                         record = json.loads(handle.read())
                         if not isinstance(record, dict):
                             continue
-                        requests += 1
-                        operation_id = record.get("operation_id")
-                        if isinstance(operation_id, str) and operation_id:
-                            rounds.add(operation_id)
-                        response = record.get("response")
-                        usage = response.get("usage") if isinstance(response, dict) else None
-                        if not isinstance(usage, dict):
-                            continue
-                        usage_records += 1
-                        input_tokens += self._telemetry_int(
-                            usage,
-                            "prompt_tokens",
-                            "input_tokens",
-                            "prompt_token_count",
-                            "promptTokenCount",
-                        ) or 0
-                        output_tokens += self._telemetry_int(
-                            usage,
-                            "completion_tokens",
-                            "output_tokens",
-                            "candidates_token_count",
-                            "candidatesTokenCount",
-                        ) or 0
-                        details = usage.get("prompt_tokens_details")
-                        cache_tokens += self._telemetry_int(
-                            details if isinstance(details, dict) else {},
-                            "cached_tokens", "cache_read_input_tokens", "cached_content_token_count",
-                        ) or self._telemetry_int(
-                            usage,
-                            "cache_tokens",
-                            "cached_tokens",
-                            "cache_read_input_tokens",
-                            "cachedContentTokenCount",
-                        ) or 0
+                        record_trace(record)
             except (OSError, tarfile.TarError, json.JSONDecodeError):
                 pass
+
+        requests = trace_requests or stream_requests
+        rounds = trace_rounds or stream_rounds
+        if trace_usage_records:
+            usage_records = trace_usage_records
+            input_tokens = trace_input_tokens
+            output_tokens = trace_output_tokens
+            cache_tokens = trace_cache_tokens
+        else:
+            usage_records = stream_usage_records
+            input_tokens = stream_input_tokens
+            output_tokens = stream_output_tokens
+            cache_tokens = stream_cache_tokens
 
         self._telemetry_metadata = {
             "mode": _TELEMETRY_MODE,

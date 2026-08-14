@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 import subprocess
 import tarfile
 from pathlib import Path
@@ -11,6 +12,7 @@ from pier.agents.installed.base import NonZeroAgentExitCodeError
 from pier.agents.installed.bitfun_cli import (
     BitfunCli,
     _NETWORK_POLICY_PREAMBLE,
+    _build_cp_back_command,
     _format_failure_log_text,
     build_commit_final_changes_script,
     build_repo_state_capture_script,
@@ -59,7 +61,13 @@ class FakeEnvironment:
                 stdout="provider request failed: diagnostic marker", return_code=7
             )
         if "bitfun-cli --version" in command:
-            return ExecResult(stdout="bitfun-cli 1.2.3\n", return_code=0)
+            return ExecResult(
+                stdout=(
+                    "Warning: `bitfun-cli` is deprecated; use `bitfun` instead.\n"
+                    "bitfun 1.2.3\n"
+                ),
+                return_code=0,
+            )
         if "sha256sum" in command:
             return ExecResult(
                 stdout="checksum  /usr/local/bin/bitfun-cli\n", return_code=0
@@ -188,11 +196,15 @@ def test_run_preserves_diagnostics_and_runtime_config(tmp_path: Path):
 
     commands = [command for command, _ in environment.calls]
     run_command = next(command for command in commands if "bitfun-cli exec" in command)
+    run_env = next(
+        env for command, env in environment.calls if "bitfun-cli exec" in command
+    )
     assert _NETWORK_POLICY_PREAMBLE in run_command
     assert "stdbuf -oL tee" in run_command
     assert "--output-format stream-json" in run_command
     assert "--verify-final-changes" in run_command
     assert " exec --auto --verify-final-changes" in run_command
+    assert run_env["BITFUN_HOME"] == "/tmp/pier-bitfun-home"
     assert any("git-head.before.txt" in command for command in commands)
     assert any("git-head.after.txt" in command for command in commands)
     assert any("cp-back-manifest.json" in command for command in commands)
@@ -206,6 +218,7 @@ def test_run_preserves_diagnostics_and_runtime_config(tmp_path: Path):
         tmp_path / "bitfun/cp-back-manifest.host.json"
     ).read_text() == '{"sessions":false}\n'
     metadata = context.metadata["bitfun_cli"]
+    assert metadata["binary_version"] == "bitfun 1.2.3"
     assert metadata["model_endpoint_domains"] == ["gateway.example.com"]
     assert metadata["verify_final_changes"] is True
     assert metadata["auto_approve_tools"] is True
@@ -293,27 +306,47 @@ def test_air_gapped_run_requires_a_model_endpoint(tmp_path: Path):
         )
 
 
-def test_finalize_telemetry_maps_events_and_usage_to_agent_context(tmp_path: Path):
+def test_cp_back_collects_session_request_traces_from_isolated_home(tmp_path: Path):
+    bitfun_home = tmp_path / "home"
+    source = (
+        bitfun_home
+        / "projects/app/sessions/session-1/request-traces/request-000001.json"
+    )
+    source.parent.mkdir(parents=True)
+    source.write_text('{"operation_id":"round-1"}\n')
+    logs = tmp_path / "logs"
+    env = os.environ.copy()
+    env["BITFUN_HOME"] = str(bitfun_home)
+    env["XDG_CONFIG_HOME"] = str(tmp_path / "config")
+
+    subprocess.run(
+        ["bash", "-c", _build_cp_back_command(logs.as_posix())],
+        env=env,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    copied = logs / "bitfun/request-traces/session-1/request-000001.json"
+    assert copied.read_text() == source.read_text()
+    manifest = json.loads((logs / "bitfun/cp-back-manifest.json").read_text())
+    assert manifest["request_traces"] is True
+    with tarfile.open(logs / "bitfun/request-traces.tar.gz", "r:gz") as archive:
+        assert "request-traces/session-1/request-000001.json" in archive.getnames()
+
+
+def test_finalize_telemetry_maps_stream_events_to_agent_context(tmp_path: Path):
     telemetry_dir = tmp_path / "bitfun"
     telemetry_dir.mkdir()
     (telemetry_dir / "exec-events.jsonl").write_text(
-        '{"type":"tool_start"}\n{"type":"subagent_tool_start"}\n'
-    )
-    traces = telemetry_dir / "request-traces" / "session"
-    traces.mkdir(parents=True)
-    (traces / "000001.json").write_text(
-        json.dumps(
-            {
-                "operation_id": "round-1",
-                "response": {
-                    "usage": {
-                        "prompt_tokens": 12,
-                        "completion_tokens": 3,
-                        "prompt_tokens_details": {"cached_tokens": 2},
-                    }
-                },
-            }
-        )
+        "Warning: `bitfun-cli` is deprecated; use `bitfun` instead.\n"
+        '{"event":{"type":"ModelRoundStarted","round_id":"round-1"}}\n'
+        '{"event":{"type":"TokenUsageUpdated","input_tokens":12,'
+        '"output_tokens":3,"cached_tokens":2}}\n'
+        '{"event":{"type":"ToolEvent","tool_event":'
+        '{"event_type":"Started"}}}\n'
+        '{"event":{"type":"ModelRoundCompleted","round_id":"round-1",'
+        '"attempt_count":2}}\n'
     )
     context = AgentContext()
 
@@ -325,6 +358,23 @@ def test_finalize_telemetry_maps_events_and_usage_to_agent_context(tmp_path: Pat
     assert context.n_output_tokens == 3
     assert context.n_cache_tokens == 2
     assert context.metadata is None
+    assert agent._telemetry_metadata["stream_event_count"] == 4
+    assert agent._telemetry_metadata["tool_calls"] == 1
+    assert agent._telemetry_metadata["model_requests"] == 2
+    assert agent._telemetry_metadata["model_rounds"] == 1
+    assert agent._telemetry_metadata["usage_records"] == 1
+
+
+def test_finalize_telemetry_accepts_legacy_top_level_tool_events(tmp_path: Path):
+    telemetry_dir = tmp_path / "bitfun"
+    telemetry_dir.mkdir()
+    (telemetry_dir / "exec-events.jsonl").write_text(
+        '{"type":"tool_start"}\n{"type":"subagent_tool_start"}\n'
+    )
+
+    agent = BitfunCli(logs_dir=tmp_path)
+    agent._finalize_telemetry(AgentContext())
+
     assert agent._telemetry_metadata["tool_calls"] == 2
 
 
