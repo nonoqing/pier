@@ -188,6 +188,7 @@ class BitfunCli(BaseAgent):
         bitfun_config: dict[str, Any] | None = None,
         commit_final_changes: bool = True,
         network_policy_prompt: bool = True,
+        auto_approve_tools: bool = False,
         extra_env: dict[str, str] | None = None,
         version: str | None = None,
         **kwargs: Any,
@@ -200,6 +201,8 @@ class BitfunCli(BaseAgent):
             raise ValueError("commit_final_changes must be a bool")
         if not isinstance(network_policy_prompt, bool):
             raise ValueError("network_policy_prompt must be a bool")
+        if not isinstance(auto_approve_tools, bool):
+            raise ValueError("auto_approve_tools must be a bool")
         if bitfun_config is not None and not isinstance(bitfun_config, dict):
             raise ValueError("bitfun_config must be a dict when provided")
 
@@ -215,6 +218,7 @@ class BitfunCli(BaseAgent):
         self._bitfun_config = bitfun_config
         self._commit_final_changes = commit_final_changes
         self._network_policy_prompt = network_policy_prompt
+        self._auto_approve_tools = auto_approve_tools
         self._extra_env = dict(extra_env or {})
         self._version = version
         self._binary_sha256: str | None = None
@@ -309,6 +313,7 @@ class BitfunCli(BaseAgent):
             "verify_final_changes": True,
             "commit_final_changes": self._commit_final_changes,
             "network_policy_prompt": self._network_policy_prompt,
+            "auto_approve_tools": self._auto_approve_tools,
             "stdout_path": "agent/bitfun.txt",
             "diagnostics_path": "agent/bitfun",
             "git_evidence_path": "agent/bitfun/git",
@@ -782,6 +787,7 @@ class BitfunCli(BaseAgent):
             await self._configure_telemetry(environment)
             self._update_context_metadata(context)
             await self._capture_repo_state(environment, "before")
+            auto_approve_flag = " --auto" if self._auto_approve_tools else ""
             command = (
                 "set -o pipefail\n"
                 f"mkdir -p {shlex.quote(EnvironmentPaths.agent_dir.as_posix())}\n"
@@ -790,7 +796,7 @@ class BitfunCli(BaseAgent):
                 "else\n"
                 f"  bitfun_tee() {{ tee {shlex.quote(self._remote_agent_log)}; }}\n"
                 "fi\n"
-                f"{shlex.quote(self._binary_path)} exec --verify-final-changes --output-format stream-json --agent {shlex.quote(self._exec_agent)} -- "
+                f"{shlex.quote(self._binary_path)} exec{auto_approve_flag} --verify-final-changes --output-format stream-json --agent {shlex.quote(self._exec_agent)} -- "
                 f"{shlex.quote(self._instruction_for(environment, instruction))} "
                 "2>&1 | bitfun_tee\n"
                 "rc=${PIPESTATUS[0]}\n"

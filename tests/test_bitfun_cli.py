@@ -178,6 +178,7 @@ def test_run_preserves_diagnostics_and_runtime_config(tmp_path: Path):
         model_name="deepseek-v4-pro",
         model_endpoint_urls=["https://gateway.example.com/v1"],
         extra_env={"XDG_CONFIG_HOME": "/testbed/.config"},
+        auto_approve_tools=True,
     )
     environment = FakeEnvironment()
     context = AgentContext()
@@ -191,6 +192,7 @@ def test_run_preserves_diagnostics_and_runtime_config(tmp_path: Path):
     assert "stdbuf -oL tee" in run_command
     assert "--output-format stream-json" in run_command
     assert "--verify-final-changes" in run_command
+    assert " exec --auto --verify-final-changes" in run_command
     assert any("git-head.before.txt" in command for command in commands)
     assert any("git-head.after.txt" in command for command in commands)
     assert any("cp-back-manifest.json" in command for command in commands)
@@ -206,6 +208,7 @@ def test_run_preserves_diagnostics_and_runtime_config(tmp_path: Path):
     metadata = context.metadata["bitfun_cli"]
     assert metadata["model_endpoint_domains"] == ["gateway.example.com"]
     assert metadata["verify_final_changes"] is True
+    assert metadata["auto_approve_tools"] is True
     assert metadata["runtime_config"]["default_models"] == {
         "primary": "deepseek-v4-pro",
         "fast": "deepseek-v4-pro",
@@ -214,6 +217,25 @@ def test_run_preserves_diagnostics_and_runtime_config(tmp_path: Path):
     uploaded = environment.uploads["/logs/agent/bitfun/config/app.redacted.json"]
     assert "must-not-leak" not in uploaded
     assert "[REDACTED]" in uploaded
+
+
+def test_auto_approve_tools_is_opt_in(tmp_path: Path):
+    agent = BitfunCli(
+        logs_dir=tmp_path,
+        model_endpoint_urls=["https://gateway.example.com/v1"],
+    )
+    environment = FakeEnvironment()
+    context = AgentContext()
+
+    asyncio.run(agent.run("Fix the failing test.", environment, context))
+
+    commands = [command for command, _ in environment.calls]
+    run_command = next(command for command in commands if "bitfun-cli exec" in command)
+    assert " exec --auto " not in run_command
+    assert context.metadata["bitfun_cli"]["auto_approve_tools"] is False
+
+    with pytest.raises(ValueError, match="auto_approve_tools must be a bool"):
+        BitfunCli(logs_dir=tmp_path, auto_approve_tools="true")
 
 
 def test_cli_failure_persists_output_runs_finally_and_raises_pier_error(tmp_path: Path):
