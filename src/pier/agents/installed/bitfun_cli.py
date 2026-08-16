@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import posixpath
 import shlex
 import tarfile
 import tempfile
@@ -185,6 +186,8 @@ class BitfunCli(BaseAgent):
         model_endpoint_urls: Iterable[str] | None = None,
         bitfun_config: dict[str, Any] | None = None,
         commit_final_changes: bool = True,
+        verify_final_changes: bool = True,
+        harness_profile: str | None = None,
         network_policy_prompt: bool = True,
         auto_approve_tools: bool = False,
         extra_env: dict[str, str] | None = None,
@@ -197,6 +200,12 @@ class BitfunCli(BaseAgent):
             raise ValueError("exec_agent must be a non-empty string")
         if not isinstance(commit_final_changes, bool):
             raise ValueError("commit_final_changes must be a bool")
+        if not isinstance(verify_final_changes, bool):
+            raise ValueError("verify_final_changes must be a bool")
+        if harness_profile is not None and (
+            not isinstance(harness_profile, str) or not harness_profile.strip()
+        ):
+            raise ValueError("harness_profile must be a non-empty string when provided")
         if not isinstance(network_policy_prompt, bool):
             raise ValueError("network_policy_prompt must be a bool")
         if not isinstance(auto_approve_tools, bool):
@@ -215,11 +224,17 @@ class BitfunCli(BaseAgent):
             raise ValueError("model_endpoint_urls must contain only strings")
         self._bitfun_config = bitfun_config
         self._commit_final_changes = commit_final_changes
+        self._verify_final_changes = verify_final_changes
+        self._harness_profile = (
+            harness_profile.strip() if isinstance(harness_profile, str) else None
+        )
         self._network_policy_prompt = network_policy_prompt
         self._auto_approve_tools = auto_approve_tools
         self._extra_env = dict(extra_env or {})
         self._version = version
         self._binary_sha256: str | None = None
+        self._companion_binary_path: str | None = None
+        self._companion_binary_sha256: str | None = None
         self._runtime_config_metadata: dict[str, Any] | None = None
         self._effective_xdg_config_home: str | None = None
         self._pier_egress_proxy_configured = False
@@ -311,16 +326,39 @@ class BitfunCli(BaseAgent):
         )
         if checksum_result.return_code == 0 and checksum_result.stdout:
             self._binary_sha256 = checksum_result.stdout.split()[0]
+        if posixpath.basename(self._binary_path) == "bitfun-cli":
+            companion = posixpath.join(posixpath.dirname(self._binary_path), "bitfun")
+            companion_binary = shlex.quote(companion)
+            companion_checksum_result = await environment.exec(
+                command=(
+                    f"if test -f {companion_binary}; then "
+                    "if command -v sha256sum >/dev/null 2>&1; "
+                    f"then sha256sum {companion_binary}; "
+                    f"else shasum -a 256 {companion_binary}; fi; fi"
+                ),
+                env=self._runtime_env(environment),
+            )
+            if (
+                companion_checksum_result.return_code == 0
+                and companion_checksum_result.stdout
+            ):
+                self._companion_binary_path = companion
+                self._companion_binary_sha256 = (
+                    companion_checksum_result.stdout.split()[0]
+                )
 
     def _provenance_metadata(self) -> dict[str, Any]:
         metadata: dict[str, Any] = {
             "binary_path": self._binary_path,
             "binary_sha256": self._binary_sha256,
+            "companion_binary_path": self._companion_binary_path,
+            "companion_binary_sha256": self._companion_binary_sha256,
             "binary_version": self._version,
             "model_name": self.model_name,
             "model_endpoint_domains": self.network_allowlist().domains,
             "exec_agent": self._exec_agent,
-            "verify_final_changes": True,
+            "verify_final_changes": self._verify_final_changes,
+            "harness_profile": self._harness_profile,
             "commit_final_changes": self._commit_final_changes,
             "network_policy_prompt": self._network_policy_prompt,
             "auto_approve_tools": self._auto_approve_tools,
@@ -829,6 +867,14 @@ class BitfunCli(BaseAgent):
             self._update_context_metadata(context)
             await self._capture_repo_state(environment, "before")
             auto_approve_flag = " --auto" if self._auto_approve_tools else ""
+            harness_profile_flag = (
+                f" --harness-profile {shlex.quote(self._harness_profile)}"
+                if self._harness_profile is not None
+                else ""
+            )
+            verify_final_changes_flag = (
+                " --verify-final-changes" if self._verify_final_changes else ""
+            )
             command = (
                 "set -o pipefail\n"
                 f"mkdir -p {shlex.quote(EnvironmentPaths.agent_dir.as_posix())}\n"
@@ -837,7 +883,7 @@ class BitfunCli(BaseAgent):
                 "else\n"
                 f"  bitfun_tee() {{ tee {shlex.quote(self._remote_agent_log)}; }}\n"
                 "fi\n"
-                f"{shlex.quote(self._binary_path)} exec{auto_approve_flag} --verify-final-changes --output-format stream-json --agent {shlex.quote(self._exec_agent)} -- "
+                f"{shlex.quote(self._binary_path)} exec{auto_approve_flag}{harness_profile_flag}{verify_final_changes_flag} --output-format stream-json --agent {shlex.quote(self._exec_agent)} -- "
                 f"{shlex.quote(self._instruction_for(environment, instruction))} "
                 "2>&1 | bitfun_tee\n"
                 "rc=${PIPESTATUS[0]}\n"

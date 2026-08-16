@@ -69,6 +69,11 @@ class FakeEnvironment:
                 return_code=0,
             )
         if "sha256sum" in command:
+            if "/usr/local/bin/bitfun;" in command:
+                return ExecResult(
+                    stdout="primary-checksum  /usr/local/bin/bitfun\n",
+                    return_code=0,
+                )
             return ExecResult(
                 stdout="checksum  /usr/local/bin/bitfun-cli\n", return_code=0
             )
@@ -219,8 +224,12 @@ def test_run_preserves_diagnostics_and_runtime_config(tmp_path: Path):
     ).read_text() == '{"sessions":false}\n'
     metadata = context.metadata["bitfun_cli"]
     assert metadata["binary_version"] == "bitfun 1.2.3"
+    assert metadata["binary_sha256"] == "checksum"
+    assert metadata["companion_binary_path"] == "/usr/local/bin/bitfun"
+    assert metadata["companion_binary_sha256"] == "primary-checksum"
     assert metadata["model_endpoint_domains"] == ["gateway.example.com"]
     assert metadata["verify_final_changes"] is True
+    assert metadata["harness_profile"] is None
     assert metadata["auto_approve_tools"] is True
     assert metadata["runtime_config"]["default_models"] == {
         "primary": "deepseek-v4-pro",
@@ -249,6 +258,34 @@ def test_auto_approve_tools_is_opt_in(tmp_path: Path):
 
     with pytest.raises(ValueError, match="auto_approve_tools must be a bool"):
         BitfunCli(logs_dir=tmp_path, auto_approve_tools="true")
+
+
+def test_run_can_select_harness_profile_without_legacy_verification_flag(
+    tmp_path: Path,
+):
+    agent = BitfunCli(
+        logs_dir=tmp_path,
+        model_endpoint_urls=["https://gateway.example.com/v1"],
+        harness_profile="minimal",
+        verify_final_changes=False,
+    )
+    environment = FakeEnvironment()
+    context = AgentContext()
+
+    asyncio.run(agent.run("Fix the failing test.", environment, context))
+
+    run_command = next(
+        command for command, _ in environment.calls if "bitfun-cli exec" in command
+    )
+    assert " exec --harness-profile minimal " in run_command
+    assert "--verify-final-changes" not in run_command
+    assert context.metadata["bitfun_cli"]["harness_profile"] == "minimal"
+    assert context.metadata["bitfun_cli"]["verify_final_changes"] is False
+
+    with pytest.raises(ValueError, match="verify_final_changes must be a bool"):
+        BitfunCli(logs_dir=tmp_path, verify_final_changes="false")
+    with pytest.raises(ValueError, match="harness_profile must be a non-empty string"):
+        BitfunCli(logs_dir=tmp_path, harness_profile="  ")
 
 
 def test_cli_failure_persists_output_runs_finally_and_raises_pier_error(tmp_path: Path):
